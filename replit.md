@@ -1,7 +1,7 @@
-# Paper Tutor - AI-Powered Academic Dissertation Intelligence Platform
+# RavPaper Tutor - AI-Powered Academic Dissertation Intelligence Platform
 
 ## Overview
-Paper Tutor is a full-stack enterprise SaaS application for AI-powered academic document review and analysis. It features multi-agent AI analysis, JWT authentication with RBAC, and a comprehensive analysis engine suite.
+RavPaper Tutor is a full-stack enterprise SaaS application for AI-powered academic document review and analysis. It features multi-agent AI analysis, JWT authentication with RBAC, and a comprehensive analysis engine suite.
 
 ## Tech Stack
 - Frontend: React + TypeScript + Tailwind CSS + shadcn/ui

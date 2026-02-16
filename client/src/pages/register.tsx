@@ -67,7 +67,7 @@ export default function RegisterPage() {
               <GraduationCap className="h-8 w-8 text-primary-foreground" />
             </div>
             <div>
-              <h1 className="text-2xl font-bold text-primary-foreground">Paper Tutor</h1>
+              <h1 className="text-2xl font-bold text-primary-foreground">RavPaper Tutor</h1>
               <p className="text-sm text-primary-foreground/80">AI-Powered Academic Intelligence</p>
             </div>
           </div>
@@ -95,10 +95,10 @@ export default function RegisterPage() {
           <CardHeader>
             <div className="flex items-center gap-2 lg:hidden mb-4">
               <GraduationCap className="h-6 w-6 text-primary" />
-              <span className="text-lg font-semibold">Paper Tutor</span>
+              <span className="text-lg font-semibold">RavPaper Tutor</span>
             </div>
             <CardTitle className="text-xl">Create an account</CardTitle>
-            <CardDescription>Get started with Paper Tutor</CardDescription>
+            <CardDescription>Get started with RavPaper Tutor</CardDescription>
           </CardHeader>
           <CardContent>
             <Form {...form}>

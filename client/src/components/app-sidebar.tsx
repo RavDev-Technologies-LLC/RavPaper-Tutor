@@ -84,7 +84,7 @@ export function AppSidebar() {
             <GraduationCap className="h-5 w-5" />
           </div>
           <div className="flex flex-col">
-            <span className="text-sm font-semibold" data-testid="text-app-name">Paper Tutor</span>
+            <span className="text-sm font-semibold" data-testid="text-app-name">RavPaper Tutor</span>
             <span className="text-xs text-muted-foreground">Academic Intelligence</span>
           </div>
         </div>
