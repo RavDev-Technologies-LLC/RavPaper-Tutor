@@ -6,7 +6,7 @@ import type { User } from "@shared/schema";
 export function useAuth() {
   const { data: user, isLoading } = useQuery<User | null>({
     queryKey: ["/api/auth/me"],
-    queryFn: authQueryFn,
+    queryFn: authQueryFn as unknown as () => Promise<User | null>,
     retry: false,
     staleTime: 5 * 60 * 1000,
   });
@@ -58,7 +58,7 @@ export function useAuth() {
   };
 
   return {
-    user: user ?? null,
+    user: (user ?? null) as User | null,
     isLoading,
     isAuthenticated: !!user,
     login: loginMutation.mutateAsync,
