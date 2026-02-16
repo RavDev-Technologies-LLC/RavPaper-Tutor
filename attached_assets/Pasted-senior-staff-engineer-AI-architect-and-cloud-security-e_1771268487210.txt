@@ -1,0 +1,601 @@
+senior staff engineer, AI architect, and cloud security engineer.
+
+Build a full-stack, enterprise SaaS web application called:
+
+Paper Tutor
+
+An AI-powered academic dissertation intelligence and review platform.
+
+The platform must include:
+
+Multi-agent AI analysis
+
+Document parsing engine
+
+Rubric alignment engine
+
+Statistical audit engine
+
+Literature synthesis engine
+
+Anthropomorphism detection engine
+
+Plagiarism detection engine
+
+Annotation system
+
+Defense simulation engine
+
+Multi-tenant architecture
+
+Zero-trust security model
+
+Enterprise RBAC
+
+Vector search
+
+Audit logging
+
+Full REST API
+
+Microservice architecture
+
+Generate complete working code.
+
+🏗 ARCHITECTURE REQUIREMENTS
+
+Use the following stack:
+
+Frontend:
+
+Next.js 14 (App Router)
+
+TypeScript
+
+Tailwind CSS
+
+ShadCN UI
+
+React Query
+
+JWT authentication
+
+Protected routes
+
+Backend:
+
+FastAPI (Python)
+
+PostgreSQL
+
+Redis (job queue)
+
+Celery
+
+Pinecone or Weaviate (vector DB abstraction layer)
+
+Neo4j (knowledge graph optional enterprise)
+
+Docker
+
+Kubernetes manifests
+
+JWT authentication (short-lived tokens)
+
+OAuth2 support
+
+RBAC middleware
+
+Infrastructure:
+
+S3-compatible object storage
+
+AWS KMS-compatible key management
+
+HashiCorp Vault integration
+
+WAF-ready
+
+Rate limiting middleware
+
+Audit logging
+
+Tenant isolation
+
+📁 MONOREPO STRUCTURE
+
+Create the following structure:
+
+/paper-tutor
+│
+├── /apps
+│ ├── /frontend (Next.js)
+│ ├── /api-gateway
+│ ├── /parser-service
+│ ├── /plagiarism-service
+│ ├── /rubric-service
+│ ├── /statistics-service
+│ ├── /literature-service
+│ ├── /anthropomorphism-service
+│ ├── /formatting-service
+│ ├── /defense-service
+│ ├── /annotation-service
+│ ├── /security-service
+│ └── /scoring-service
+│
+├── /packages
+│ ├── /auth
+│ ├── /db
+│ ├── /schemas
+│ ├── /utils
+│ └── /ai-prompts
+│
+├── /infra
+│ ├── /docker
+│ ├── /k8s
+│ ├── /terraform
+│ └── /ci-cd
+│
+└── README.md
+
+Generate all files.
+
+👥 ROLE-BASED ACCESS CONTROL (RBAC)
+
+Implement roles:
+
+Student
+
+DoctoralCandidate
+
+Chair
+
+CommitteeMember
+
+ProgramAdmin
+
+SecurityAdmin
+
+SuperAdmin
+
+Create:
+
+Role enum
+
+Permission enum
+
+Middleware enforcing permissions
+
+Tenant isolation (tenant_id required in every DB table)
+
+Short-lived JWT access tokens (15 min)
+
+Refresh token rotation
+
+📂 DOCUMENT SUBMISSION CATEGORIES
+
+Implement submission types:
+
+Dissertation
+
+Proposal
+
+Prospectus
+
+QuantitativeStudy
+
+QualitativeStudy
+
+MixedMethods
+
+GrantProposal
+
+IRBSubmission
+
+JournalManuscript
+
+AIResearchPaper
+
+Routing logic must trigger appropriate AI agents based on submission category.
+
+🧠 REQUIRED ENGINES
+
+Implement the following engines as microservices.
+
+1️⃣ Document Parser Engine
+
+Features:
+
+File validation
+
+Virus scanning
+
+DOCX parsing (python-docx)
+
+PDF parsing (PyMuPDF)
+
+LaTeX parsing
+
+Heading detection
+
+Sentence tokenization (spaCy)
+
+Citation extraction
+
+Statistical pattern detection
+
+Reference extraction
+
+JSON structured output
+
+Endpoint:
+POST /parser/process
+
+2️⃣ Plagiarism Engine
+
+Features:
+
+N-gram similarity
+
+Embedding similarity (OpenAI embeddings)
+
+Patchwriting detection
+
+Rewrite suggestions
+
+Endpoint:
+POST /analysis/plagiarism
+
+3️⃣ Rubric Alignment Engine
+
+Features:
+
+Convert rubric to structured JSON
+
+Embed rubric criteria
+
+Compare against document sections
+
+Output coverage score
+
+Criteria-by-criteria breakdown
+
+Endpoint:
+POST /analysis/rubric
+
+4️⃣ Statistical Audit Engine
+
+Features:
+
+p-value detection
+
+R² detection
+
+F-stat parsing
+
+Assumption test detection
+
+Causal language detection
+
+Effect size reporting validation
+
+Model-type validation
+
+Endpoint:
+POST /analysis/statistics
+
+5️⃣ Literature Synthesis Engine
+
+Features:
+
+Detect summary vs synthesis
+
+Multi-author integration score
+
+Gap clarity detection
+
+Theoretical alignment score
+
+Endpoint:
+POST /analysis/literature
+
+6️⃣ Anthropomorphism Detection Engine
+
+Features:
+
+Dependency parsing
+
+Non-human subject detection
+
+Cognitive verb detection
+
+Rewrite suggestions
+
+Risk score
+
+Endpoint:
+POST /analysis/anthropomorphism
+
+7️⃣ Formatting Compliance Engine
+
+Features:
+
+APA 7 validation
+
+Citation formatting check
+
+Reference list validation
+
+Statistical notation formatting
+
+Endpoint:
+POST /analysis/formatting
+
+8️⃣ Defense Simulation Engine
+
+Features:
+
+Generate committee-style questions
+
+Evaluate student answers
+
+Identify weak arguments
+
+Suggest rebuttals
+
+Endpoint:
+POST /analysis/defense
+
+9️⃣ Annotation Engine
+
+Features:
+
+Sentence-level annotations
+
+Severity levels
+
+Suggested rewrites
+
+Margin comment indexing
+
+Endpoint:
+GET /documents/{id}/annotations
+
+🔟 Scoring Aggregator Engine
+
+Combine all engine scores into:
+
+Overall Readiness Score
+
+Defense Readiness Index
+
+Risk Heatmap
+
+Priority Revision List
+
+Endpoint:
+POST /analysis/aggregate
+
+🔐 SECURITY SERVICE
+
+Implement:
+
+File scanning API
+
+Prompt injection firewall
+
+Rate limiting
+
+JWT validation middleware
+
+Tenant isolation middleware
+
+Audit logging
+
+Anomaly detection (basic heuristic model)
+
+Endpoints:
+
+POST /security/scan-file
+POST /security/scan-prompt
+POST /security/anomaly-check
+
+🗄 DATABASE SCHEMA
+
+Implement PostgreSQL models:
+
+USERS
+TENANTS
+DOCUMENTS
+RUBRICS
+ANALYSIS_RESULTS
+ANNOTATIONS
+AUDIT_LOGS
+VECTOR_METADATA
+
+All tables must include:
+
+tenant_id
+created_at
+updated_at
+
+🔎 VECTOR DATABASE INTEGRATION
+
+Implement:
+
+Namespace per tenant
+
+Embedding storage
+
+Similarity search
+
+Secure filtering
+
+Abstraction layer so Pinecone or Weaviate can be swapped.
+
+🧩 AI PROMPT MODULE
+
+Create centralized prompt templates for:
+
+Plagiarism agent
+
+Statistical agent
+
+Literature agent
+
+Anthropomorphism agent
+
+Rubric alignment agent
+
+Defense agent
+
+🖥 FRONTEND REQUIREMENTS
+
+Build:
+
+Login/Register
+
+Dashboard
+
+Upload Document
+
+Upload Rubric
+
+Run Analysis
+
+Annotated Viewer
+
+Score Panel
+
+Risk Heatmap
+
+Defense Simulation Panel
+
+Admin Dashboard
+
+Audit Logs Viewer
+
+Tenant Management (Admin only)
+
+Use:
+
+React Query for data fetching
+
+JWT stored securely
+
+Protected route middleware
+
+📊 ADMIN CONTROLS
+
+Admin dashboard must allow:
+
+Manage users
+
+Assign roles
+
+Configure rubric templates
+
+Set plagiarism thresholds
+
+Set statistical rigor strictness
+
+Enable/disable AI agents
+
+View analytics
+
+View anomaly alerts
+
+🔄 CI/CD
+
+Generate:
+
+Dockerfiles for all services
+
+docker-compose.yml
+
+Kubernetes deployment YAML
+
+Health check endpoints
+
+Readiness probes
+
+Liveness probes
+
+GitHub Actions workflow
+
+🧪 TESTING
+
+Generate:
+
+Unit tests (pytest)
+
+API integration tests
+
+RBAC tests
+
+Tenant isolation tests
+
+Prompt injection tests
+
+Rate limiting tests
+
+📜 API SPEC
+
+Generate full OpenAPI 3.1 spec.
+
+Expose Swagger UI.
+
+📈 PERFORMANCE
+
+Async processing
+
+Background Celery workers
+
+Chunk large documents
+
+Parallel agent execution
+
+Cache embeddings
+
+Redis caching layer
+
+🔒 COMPLIANCE
+
+Implement hooks for:
+
+FERPA compliance
+
+Data retention policies
+
+Immutable audit logs
+
+Document deletion workflows
+
+Encryption at rest
+
+📦 OUTPUT REQUIREMENTS
+
+Generate:
+
+Complete source code
+
+Folder structure
+
+Config files
+
+Environment variables template
+
+README with setup instructions
+
+Docker + K8s configs
+
+Database migrations
+
+Seed scripts
+
+Test scripts
+
+Do not generate partial code.
+Generate full production-ready scaffolding.
+
+END OF PROMPT
