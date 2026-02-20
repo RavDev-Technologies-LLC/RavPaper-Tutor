@@ -21,6 +21,9 @@ import {
   evaluateDefenseAnswer,
   runScoringAggregator,
 } from "./engines";
+import { getUncachableStripeClient, getStripePublishableKey } from "./stripeClient";
+import { sql } from "drizzle-orm";
+import { db } from "./db";
 import type { InsertAnnotation } from "@shared/schema";
 
 const JWT_SECRET = process.env.SESSION_SECRET!;
@@ -307,8 +310,19 @@ export async function registerRoutes(
       if (!doc) return res.status(404).json({ error: "Document not found" });
       if (!doc.fileContent) return res.status(400).json({ error: "Document has no content to analyze" });
 
+      const currentUser = await storage.getUser(req.user!.id);
+      if (!currentUser || currentUser.reviewCredits < 1) {
+        return res.status(402).json({
+          error: "Insufficient review credits",
+          credits: currentUser?.reviewCredits ?? 0,
+          message: "You need at least 1 review credit to run an analysis. Purchase credits from the Pricing page.",
+        });
+      }
+
       const { rubricId, engines } = req.body || {};
       const engineList: string[] = engines && engines.length > 0 ? engines : ALL_ENGINES;
+
+      await storage.deductCredit(req.user!.id, documentId, `Analysis of "${doc.title}"`);
 
       await storage.updateDocument(documentId, { status: "processing" } as any);
 
@@ -583,6 +597,170 @@ export async function registerRoutes(
         documentCount: docs.length,
         analysisCount,
       });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ─── Credit & Stripe Routes ─────────────────────────────────────
+  app.get("/api/credits/balance", authMiddleware, async (req, res) => {
+    try {
+      const user = await storage.getUser(req.user!.id);
+      res.json({ credits: user?.reviewCredits ?? 0 });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/credits/transactions", authMiddleware, async (req, res) => {
+    try {
+      const transactions = await storage.getCreditTransactions(req.user!.id);
+      res.json(transactions);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/stripe/products", async (_req, res) => {
+    try {
+      const result = await db.execute(sql`
+        SELECT 
+          p.id as product_id,
+          p.name as product_name,
+          p.description as product_description,
+          p.active as product_active,
+          p.metadata as product_metadata,
+          pr.id as price_id,
+          pr.unit_amount,
+          pr.currency
+        FROM stripe.products p
+        JOIN stripe.prices pr ON pr.product = p.id AND pr.active = true
+        WHERE p.active = true
+        ORDER BY pr.unit_amount ASC
+      `);
+
+      const productsMap = new Map<string, any>();
+      for (const row of result.rows) {
+        const r = row as any;
+        if (!productsMap.has(r.product_id)) {
+          productsMap.set(r.product_id, {
+            id: r.product_id,
+            name: r.product_name,
+            description: r.product_description,
+            metadata: r.product_metadata,
+            prices: [],
+          });
+        }
+        if (r.price_id) {
+          productsMap.get(r.product_id).prices.push({
+            id: r.price_id,
+            unitAmount: r.unit_amount,
+            currency: r.currency,
+          });
+        }
+      }
+
+      res.json(Array.from(productsMap.values()));
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/stripe/publishable-key", async (_req, res) => {
+    try {
+      const key = await getStripePublishableKey();
+      res.json({ publishableKey: key });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/stripe/checkout", authMiddleware, async (req, res) => {
+    try {
+      const { priceId, productId } = req.body;
+      if (!priceId || !productId) {
+        return res.status(400).json({ error: "priceId and productId are required" });
+      }
+
+      const stripe = await getUncachableStripeClient();
+      const user = req.user!;
+
+      let customerId = user.stripeCustomerId;
+      if (!customerId) {
+        const customer = await stripe.customers.create({
+          email: user.email,
+          name: user.fullName,
+          metadata: { userId: user.id },
+        });
+        customerId = customer.id;
+        await storage.updateUser(user.id, { stripeCustomerId: customerId } as any);
+      }
+
+      const productResult = await db.execute(sql`
+        SELECT metadata FROM stripe.products WHERE id = ${productId}
+      `);
+      const productMeta = (productResult.rows[0] as any)?.metadata;
+      const credits = productMeta?.credits ? parseInt(productMeta.credits) : 1;
+
+      const baseUrl = `${req.protocol}://${req.get("host")}`;
+      const session = await stripe.checkout.sessions.create({
+        customer: customerId,
+        payment_method_types: ["card"],
+        line_items: [{ price: priceId, quantity: 1 }],
+        mode: "payment",
+        success_url: `${baseUrl}/pricing?success=true&session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${baseUrl}/pricing?canceled=true`,
+        metadata: {
+          userId: user.id,
+          credits: String(credits),
+          productId,
+        },
+      });
+
+      res.json({ url: session.url });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/stripe/verify-session", authMiddleware, async (req, res) => {
+    try {
+      const { sessionId } = req.body;
+      if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+
+      const stripe = await getUncachableStripeClient();
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+      if (session.payment_status !== "paid") {
+        return res.json({ success: false, message: "Payment not completed" });
+      }
+
+      const existingTx = await storage.getCreditTransactions(req.user!.id);
+      const alreadyProcessed = existingTx.some(tx => tx.stripeSessionId === sessionId);
+      if (alreadyProcessed) {
+        const user = await storage.getUser(req.user!.id);
+        return res.json({ success: true, credits: user?.reviewCredits ?? 0, alreadyProcessed: true });
+      }
+
+      const credits = session.metadata?.credits ? parseInt(session.metadata.credits) : 1;
+      const { user: updatedUser } = await storage.addCredits(
+        req.user!.id,
+        credits,
+        `Purchased ${credits} review credit${credits > 1 ? "s" : ""}`,
+        sessionId
+      );
+
+      await storage.createAuditLog({
+        tenantId: req.user!.tenantId,
+        userId: req.user!.id,
+        action: "credits_purchased",
+        resourceType: "credits",
+        resourceId: sessionId,
+        details: { credits, sessionId },
+        ipAddress: getIp(req),
+      });
+
+      res.json({ success: true, credits: updatedUser.reviewCredits });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }

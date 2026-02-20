@@ -18,6 +18,8 @@ import DocumentDetailPage from "@/pages/document-detail";
 import AnalysisPage from "@/pages/analysis";
 import DefensePage from "@/pages/defense";
 import AdminPage from "@/pages/admin";
+import PricingPage from "@/pages/pricing";
+import TransactionsPage from "@/pages/transactions";
 
 function AuthenticatedLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -99,6 +101,20 @@ function Router() {
         {() => (
           <ProtectedPage>
             <AdminPage />
+          </ProtectedPage>
+        )}
+      </Route>
+      <Route path="/pricing">
+        {() => (
+          <ProtectedPage>
+            <PricingPage />
+          </ProtectedPage>
+        )}
+      </Route>
+      <Route path="/transactions">
+        {() => (
+          <ProtectedPage>
+            <TransactionsPage />
           </ProtectedPage>
         )}
       </Route>

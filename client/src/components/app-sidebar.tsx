@@ -1,4 +1,5 @@
 import { Link, useLocation } from "wouter";
+import { useQuery } from "@tanstack/react-query";
 import {
   GraduationCap,
   LayoutDashboard,
@@ -10,7 +11,11 @@ import {
   ScrollText,
   Settings,
   LogOut,
+  Coins,
+  CreditCard,
+  Receipt,
 } from "lucide-react";
+import { authQueryFn } from "@/lib/auth";
 import {
   Sidebar,
   SidebarContent,
@@ -64,6 +69,12 @@ function formatRole(role: string): string {
 export function AppSidebar() {
   const [location] = useLocation();
   const { user, logout } = useAuth();
+
+  const { data: creditBalance } = useQuery<{ credits: number }>({
+    queryKey: ["/api/credits/balance"],
+    queryFn: authQueryFn,
+    enabled: !!user,
+  });
 
   const isAdmin = user && ADMIN_ROLES.includes(user.role);
 
@@ -130,6 +141,35 @@ export function AppSidebar() {
                   </SidebarMenuButton>
                 </SidebarMenuItem>
               ))}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+
+        <SidebarGroup>
+          <SidebarGroupLabel>Credits</SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={location === "/pricing"} tooltip="Buy Credits">
+                  <Link href="/pricing" data-testid="link-pricing">
+                    <CreditCard />
+                    <span>Buy Credits</span>
+                    {creditBalance !== undefined && creditBalance !== null && (
+                      <Badge variant="secondary" className="ml-auto text-xs" data-testid="badge-credits">
+                        {creditBalance.credits}
+                      </Badge>
+                    )}
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild isActive={location === "/transactions"} tooltip="Transactions">
+                  <Link href="/transactions" data-testid="link-transactions">
+                    <Receipt />
+                    <span>Transactions</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>

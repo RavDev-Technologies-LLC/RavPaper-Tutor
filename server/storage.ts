@@ -1,4 +1,4 @@
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc, sql } from "drizzle-orm";
 import { db } from "./db";
 import {
   tenants,
@@ -9,6 +9,7 @@ import {
   annotations,
   auditLogs,
   defenseSessions,
+  creditTransactions,
   type Tenant,
   type InsertTenant,
   type User,
@@ -25,6 +26,8 @@ import {
   type InsertAuditLog,
   type DefenseSession,
   type InsertDefenseSession,
+  type CreditTransaction,
+  type InsertCreditTransaction,
 } from "@shared/schema";
 
 export interface IStorage {
@@ -70,6 +73,10 @@ export interface IStorage {
   createDefenseSession(session: InsertDefenseSession): Promise<DefenseSession>;
   updateDefenseSession(id: number, data: Partial<InsertDefenseSession>): Promise<DefenseSession | undefined>;
   getDefenseSessionsByDocument(documentId: number): Promise<DefenseSession[]>;
+
+  addCredits(userId: string, amount: number, description: string, stripeSessionId?: string): Promise<{ user: User; transaction: CreditTransaction }>;
+  deductCredit(userId: string, documentId: number, description: string): Promise<{ user: User; transaction: CreditTransaction }>;
+  getCreditTransactions(userId: string): Promise<CreditTransaction[]>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -235,6 +242,60 @@ export class DatabaseStorage implements IStorage {
 
   async getDefenseSessionsByDocument(documentId: number): Promise<DefenseSession[]> {
     return db.select().from(defenseSessions).where(eq(defenseSessions.documentId, documentId));
+  }
+
+  async addCredits(userId: string, amount: number, description: string, stripeSessionId?: string): Promise<{ user: User; transaction: CreditTransaction }> {
+    const [updatedUser] = await db
+      .update(users)
+      .set({ reviewCredits: sql`${users.reviewCredits} + ${amount}` })
+      .where(eq(users.id, userId))
+      .returning();
+
+    const [transaction] = await db
+      .insert(creditTransactions)
+      .values({
+        userId,
+        tenantId: updatedUser.tenantId,
+        type: "purchase",
+        amount,
+        balanceAfter: updatedUser.reviewCredits,
+        description,
+        stripeSessionId: stripeSessionId || null,
+      })
+      .returning();
+
+    return { user: updatedUser, transaction };
+  }
+
+  async deductCredit(userId: string, documentId: number, description: string): Promise<{ user: User; transaction: CreditTransaction }> {
+    const [updatedUser] = await db
+      .update(users)
+      .set({ reviewCredits: sql`${users.reviewCredits} - 1` })
+      .where(eq(users.id, userId))
+      .returning();
+
+    const [transaction] = await db
+      .insert(creditTransactions)
+      .values({
+        userId,
+        tenantId: updatedUser.tenantId,
+        type: "usage",
+        amount: -1,
+        balanceAfter: updatedUser.reviewCredits,
+        description,
+        documentId,
+      })
+      .returning();
+
+    return { user: updatedUser, transaction };
+  }
+
+  async getCreditTransactions(userId: string): Promise<CreditTransaction[]> {
+    return db
+      .select()
+      .from(creditTransactions)
+      .where(eq(creditTransactions.userId, userId))
+      .orderBy(desc(creditTransactions.createdAt));
   }
 }
 

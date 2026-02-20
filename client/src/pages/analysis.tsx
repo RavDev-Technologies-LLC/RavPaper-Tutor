@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
-import { FlaskConical, ArrowLeft, CheckCircle2 } from "lucide-react";
+import { FlaskConical, ArrowLeft, CheckCircle2, AlertTriangle, Coins } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { useToast } from "@/hooks/use-toast";
 import { authQueryFn, authFetch } from "@/lib/auth";
 import { queryClient } from "@/lib/queryClient";
@@ -61,6 +62,13 @@ export default function AnalysisPage() {
     queryFn: authQueryFn,
   });
 
+  const { data: creditBalance } = useQuery<{ credits: number }>({
+    queryKey: ["/api/credits/balance"],
+    queryFn: authQueryFn,
+  });
+
+  const hasCredits = (creditBalance?.credits ?? 0) >= 1;
+
   const analysisMutation = useMutation({
     mutationFn: async () => {
       const body: any = { engines: selectedEngines };
@@ -82,6 +90,8 @@ export default function AnalysisPage() {
       queryClient.invalidateQueries({ queryKey: ["/api/documents", documentId] });
       queryClient.invalidateQueries({ queryKey: ["/api/analysis/results", documentId] });
       queryClient.invalidateQueries({ queryKey: ["/api/documents"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/credits/balance"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/credits/transactions"] });
       toast({ title: "Analysis Complete", description: "All engines have completed their analysis." });
     },
     onError: (error: any) => {
@@ -165,10 +175,28 @@ export default function AnalysisPage() {
                     </SelectContent>
                   </Select>
                 </div>
+                {!hasCredits && (
+                  <Alert variant="destructive" data-testid="alert-no-credits">
+                    <AlertTriangle className="h-4 w-4" />
+                    <AlertDescription className="flex flex-col gap-2">
+                      <span>You need at least 1 review credit to run an analysis.</span>
+                      <Button size="sm" variant="outline" asChild>
+                        <Link href="/pricing">
+                          <Coins className="h-3 w-3" /> Buy Credits
+                        </Link>
+                      </Button>
+                    </AlertDescription>
+                  </Alert>
+                )}
+                {hasCredits && (
+                  <p className="text-xs text-muted-foreground" data-testid="text-credit-cost">
+                    This will use 1 credit. Balance: {creditBalance?.credits ?? 0}
+                  </p>
+                )}
                 <Button
                   className="w-full"
                   onClick={() => analysisMutation.mutate()}
-                  disabled={analysisMutation.isPending || selectedEngines.length === 0}
+                  disabled={analysisMutation.isPending || selectedEngines.length === 0 || !hasCredits}
                   data-testid="button-run-analysis"
                 >
                   {analysisMutation.isPending ? (

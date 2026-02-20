@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "wouter";
-import { FileText, FlaskConical, BarChart3, Shield, Upload, ArrowRight } from "lucide-react";
+import { FileText, FlaskConical, BarChart3, Shield, Upload, ArrowRight, Coins } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { authQueryFn } from "@/lib/auth";
 import type { Document } from "@shared/schema";
+
+interface CreditBalance {
+  credits: number;
+}
 
 function getStatusVariant(status: string): "default" | "secondary" | "destructive" | "outline" {
   switch (status) {
@@ -45,6 +49,11 @@ export default function DashboardPage() {
     queryFn: authQueryFn,
   });
 
+  const { data: creditBalance } = useQuery<CreditBalance>({
+    queryKey: ["/api/credits/balance"],
+    queryFn: authQueryFn,
+  });
+
   const totalDocs = documents?.length ?? 0;
   const completedAnalyses = documents?.filter((d) => d.status === "completed").length ?? 0;
   const avgScore = documents?.filter((d) => d.overallScore != null).length
@@ -53,15 +62,13 @@ export default function DashboardPage() {
           documents!.filter((d) => d.overallScore != null).length
       )
     : 0;
-  const activeSessions = documents?.filter((d) => d.status === "processing").length ?? 0;
-
   const recentDocs = documents?.slice(0, 5) ?? [];
 
   const stats = [
     { title: "Documents", value: totalDocs, icon: FileText, description: "Total uploaded" },
     { title: "Analyses Completed", value: completedAnalyses, icon: FlaskConical, description: "Successfully analyzed" },
     { title: "Average Score", value: avgScore, icon: BarChart3, description: "Across all documents" },
-    { title: "Active Sessions", value: activeSessions, icon: Shield, description: "Currently processing" },
+    { title: "Review Credits", value: creditBalance?.credits ?? 0, icon: Coins, description: "Available for analysis" },
   ];
 
   return (

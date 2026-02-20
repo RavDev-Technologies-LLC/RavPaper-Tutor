@@ -57,9 +57,31 @@ export const users = pgTable("users", {
   password: text("password").notNull(),
   fullName: text("full_name").notNull(),
   role: roleEnum("role").default("student").notNull(),
+  stripeCustomerId: text("stripe_customer_id"),
+  reviewCredits: integer("review_credits").default(0).notNull(),
   isActive: boolean("is_active").default(true).notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+export const transactionTypeEnum = pgEnum("transaction_type", [
+  "purchase",
+  "usage",
+  "refund",
+  "bonus",
+]);
+
+export const creditTransactions = pgTable("credit_transactions", {
+  id: serial("id").primaryKey(),
+  userId: varchar("user_id").references(() => users.id).notNull(),
+  tenantId: integer("tenant_id").references(() => tenants.id),
+  type: transactionTypeEnum("type").notNull(),
+  amount: integer("amount").notNull(),
+  balanceAfter: integer("balance_after").notNull(),
+  description: text("description"),
+  stripeSessionId: text("stripe_session_id"),
+  documentId: integer("document_id").references(() => documents.id),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
 export const documents = pgTable("documents", {
@@ -190,6 +212,11 @@ export const insertDefenseSessionSchema = createInsertSchema(defenseSessions).om
   updatedAt: true,
 });
 
+export const insertCreditTransactionSchema = createInsertSchema(creditTransactions).omit({
+  id: true,
+  createdAt: true,
+});
+
 export type InsertTenant = z.infer<typeof insertTenantSchema>;
 export type Tenant = typeof tenants.$inferSelect;
 
@@ -213,3 +240,6 @@ export type AuditLog = typeof auditLogs.$inferSelect;
 
 export type InsertDefenseSession = z.infer<typeof insertDefenseSessionSchema>;
 export type DefenseSession = typeof defenseSessions.$inferSelect;
+
+export type InsertCreditTransaction = z.infer<typeof insertCreditTransactionSchema>;
+export type CreditTransaction = typeof creditTransactions.$inferSelect;
