@@ -661,6 +661,8 @@ export async function registerRoutes(
         FROM stripe.products p
         JOIN stripe.prices pr ON pr.product = p.id AND pr.active = true
         WHERE p.active = true
+          AND p.livemode = false
+          AND pr.livemode = false
         ORDER BY pr.unit_amount ASC
       `);
 
@@ -713,9 +715,12 @@ export async function registerRoutes(
       const product = await stripe.products.retrieve(productId);
       const productOfPrice = typeof price.product === "string" ? price.product : price.product.id;
       if (!validCatalogPrice({ ...price, product: productOfPrice }, product)) return res.status(400).json({ error: "Invalid credit package" });
-      if (price.livemode && process.env.STRIPE_LIVE_CHARGING_ENABLED !== "true") return res.status(503).json({ error: "Live payments disabled" });
+      if (price.livemode || product.livemode) return res.status(503).json({ error: "Live payments disabled" });
       const credits = parseCreditAmount(product.metadata.credits)!;
-      const configuredOrigin = process.env.APP_BASE_URL;
+      const configuredOrigin = process.env.APP_BASE_URL ||
+        (process.env.NODE_ENV !== "production" && process.env.REPLIT_DEV_DOMAIN
+          ? `https://${process.env.REPLIT_DEV_DOMAIN}`
+          : undefined);
       if (!configuredOrigin) return res.status(503).json({ error: "Payment configuration unavailable" });
       const origin = new URL(configuredOrigin);
       if (origin.protocol !== "https:" && !(process.env.NODE_ENV !== "production" && origin.protocol === "http:" && ["localhost", "127.0.0.1"].includes(origin.hostname))) return res.status(503).json({ error: "Invalid payment configuration" });

@@ -129,6 +129,9 @@ export default function PricingPage() {
           Purchase review credits to run AI-powered analysis on your academic papers.
           Each analysis consumes 1 credit, regardless of how many engines you select.
         </p>
+        <p className="text-sm font-medium text-amber-700 dark:text-amber-300" role="status" data-testid="text-stripe-test-mode">
+          Stripe test mode is active. No real charges can be made.
+        </p>
         {balance !== undefined && (
           <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-primary/10 text-primary">
             <Sparkles className="h-4 w-4" />

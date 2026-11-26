@@ -30,15 +30,17 @@ async function initStripe() {
 
     const stripeSync = await getStripeSync();
 
-    console.log('Setting up managed webhook...');
-    const webhookBaseUrl = `https://${process.env.REPLIT_DOMAINS?.split(',')[0]}`;
-    try {
-      const result = await stripeSync.findOrCreateManagedWebhook(
-        `${webhookBaseUrl}/api/stripe/webhook`
-      );
-      console.log(`Webhook configured: ${result?.webhook?.url || 'OK'}`);
-    } catch (webhookErr: any) {
-      console.warn('Webhook setup skipped (may need deployment):', webhookErr.message);
+    const webhookHost = process.env.REPLIT_DOMAINS?.split(',').map((host) => host.trim()).find(Boolean);
+    if (!webhookHost) {
+      console.warn('Stripe development webhook setup skipped: no Replit domain is configured');
+    } else {
+      try {
+        const webhookUrl = new URL('/api/stripe/webhook', `https://${webhookHost}`).toString();
+        await stripeSync.findOrCreateManagedWebhook(webhookUrl);
+        console.log('Stripe development webhook configured');
+      } catch {
+        console.warn('Stripe development webhook setup skipped');
+      }
     }
 
     console.log('Syncing Stripe data...');
@@ -51,7 +53,9 @@ async function initStripe() {
 }
 
 // Explicit development provisioning only; production startup must not modify Stripe or database schema.
-if (process.env.NODE_ENV !== 'production' && process.env.REPLIT_DEPLOYMENT !== '1' && process.env.STRIPE_DEV_PROVISION === 'true') await initStripe();
+if (process.env.NODE_ENV !== 'production' && process.env.REPLIT_DEPLOYMENT !== '1' && process.env.STRIPE_DEV_PROVISION === 'true') {
+  void initStripe();
+}
 
 app.post(
   '/api/stripe/webhook',
