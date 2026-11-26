@@ -1,4 +1,6 @@
 import { getStripeSync } from './stripeClient';
+import type Stripe from 'stripe';
+import { settleCheckoutEvent } from './payment-settlement';
 
 export class WebhookHandlers {
   static async processWebhook(payload: Buffer, signature: string): Promise<void> {
@@ -13,5 +15,9 @@ export class WebhookHandlers {
 
     const sync = await getStripeSync();
     await sync.processWebhook(payload, signature);
+
+    // processWebhook validates the signature before returning; only then trust this event body.
+    const event = JSON.parse(payload.toString('utf8')) as Stripe.Event;
+    await settleCheckoutEvent(event);
   }
 }

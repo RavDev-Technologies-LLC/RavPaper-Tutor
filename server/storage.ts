@@ -74,7 +74,7 @@ export interface IStorage {
   updateDefenseSession(id: number, data: Partial<InsertDefenseSession>): Promise<DefenseSession | undefined>;
   getDefenseSessionsByDocument(documentId: number): Promise<DefenseSession[]>;
 
-  addCredits(userId: string, amount: number, description: string, stripeSessionId?: string): Promise<{ user: User; transaction: CreditTransaction }>;
+  addCredits(userId: string, amount: number, description: string, stripeSessionId?: string): Promise<{ user: User; transaction: CreditTransaction; alreadyProcessed: boolean }>;
   deductCredit(userId: string, documentId: number, description: string): Promise<{ user: User; transaction: CreditTransaction }>;
   getCreditTransactions(userId: string): Promise<CreditTransaction[]>;
   refundFailedAnalysis(userId: string, usageId: number, resultId?: number): Promise<void>;
@@ -249,7 +249,7 @@ export class DatabaseStorage implements IStorage {
     return db.select().from(defenseSessions).where(eq(defenseSessions.documentId, documentId));
   }
 
-  async addCredits(userId: string, amount: number, description: string, stripeSessionId?: string): Promise<{ user: User; transaction: CreditTransaction }> {
+  async addCredits(userId: string, amount: number, description: string, stripeSessionId?: string): Promise<{ user: User; transaction: CreditTransaction; alreadyProcessed: boolean }> {
     if (!Number.isSafeInteger(amount) || amount < 1 || amount > 999999) throw new Error("Invalid credit amount");
     return db.transaction(async tx => {
       if (stripeSessionId) {
@@ -259,7 +259,7 @@ export class DatabaseStorage implements IStorage {
           if (existing.userId !== userId || existing.type !== "purchase" || existing.amount !== amount) throw new PaymentOwnershipError("Payment already processed");
           const [user] = await tx.select().from(users).where(eq(users.id, userId));
           if (!user) throw new Error("User not found");
-          return { user, transaction: existing };
+          return { user, transaction: existing, alreadyProcessed: true };
         }
       }
       const [user] = await tx.update(users).set({ reviewCredits: sql`${users.reviewCredits} + ${amount}` })
@@ -269,7 +269,7 @@ export class DatabaseStorage implements IStorage {
         userId, tenantId: user.tenantId, type: "purchase", amount, balanceAfter: user.reviewCredits,
         description, stripeSessionId: stripeSessionId || null,
       }).returning();
-      return { user, transaction };
+      return { user, transaction, alreadyProcessed: false };
     });
   }
 

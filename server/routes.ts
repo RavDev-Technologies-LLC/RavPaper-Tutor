@@ -1,7 +1,7 @@
 import type { Express } from "express";
 import type { Server } from "http";
 import { storage, InsufficientCreditsError, PaymentOwnershipError, AnalysisInProgressError } from "./storage";
-import { ownsPayment, parseCreditAmount, validCatalogPrice } from "./billing-policy";
+import { parseCreditAmount, validCatalogPrice } from "./billing-policy";
 import {
   authMiddleware,
   requireRole,
@@ -23,7 +23,8 @@ import {
   evaluateDefenseAnswer,
   runScoringAggregator,
 } from "./engines";
-import { getUncachableStripeClient, getStripePublishableKey } from "./stripeClient";
+import { getUncachableStripeClient, getStripePublishableKey, getStripeSync } from "./stripeClient";
+import { settleCheckoutSession } from "./payment-settlement";
 import { sql } from "drizzle-orm";
 import { db } from "./db";
 import type { InsertAnnotation } from "@shared/schema";
@@ -648,27 +649,49 @@ export async function registerRoutes(
 
   app.get("/api/stripe/products", async (_req, res) => {
     try {
+      const stripeSync = await getStripeSync();
+      const stripeAccountId = await stripeSync.getAccountId();
       const result = await db.execute(sql`
         SELECT 
           p.id as product_id,
           p.name as product_name,
           p.description as product_description,
           p.active as product_active,
+          p.livemode as product_livemode,
           p.metadata as product_metadata,
           pr.id as price_id,
+          pr.product as price_product_id,
+          pr.active as price_active,
+          pr.type as price_type,
+          pr.livemode as price_livemode,
           pr.unit_amount,
           pr.currency
         FROM stripe.products p
-        JOIN stripe.prices pr ON pr.product = p.id AND pr.active = true
-        WHERE p.active = true
-          AND p.livemode = false
-          AND pr.livemode = false
+        JOIN stripe.prices pr ON pr.product = p.id
+          AND pr._account_id = ${stripeAccountId}
+        WHERE p._account_id = ${stripeAccountId}
+          AND p.active = true
         ORDER BY pr.unit_amount ASC
       `);
 
       const productsMap = new Map<string, any>();
       for (const row of result.rows) {
         const r = row as any;
+        const product = {
+          id: r.product_id,
+          active: r.product_active,
+          livemode: r.product_livemode,
+          metadata: r.product_metadata ?? {},
+        };
+        const price = {
+          active: r.price_active,
+          type: r.price_type,
+          unit_amount: r.unit_amount,
+          currency: r.currency,
+          product: r.price_product_id,
+          livemode: r.price_livemode,
+        };
+        if (!validCatalogPrice(price, product)) continue;
         if (!productsMap.has(r.product_id)) {
           productsMap.set(r.product_id, {
             id: r.product_id,
@@ -764,45 +787,13 @@ export async function registerRoutes(
       const { sessionId } = req.body;
       if (typeof sessionId !== "string" || !sessionId || sessionId.length > 256) return res.status(400).json({ error: "sessionId required" });
 
-      const stripe = await getUncachableStripeClient();
-      const session = await stripe.checkout.sessions.retrieve(sessionId);
-
-      const customer = typeof session.customer === "string" ? session.customer : session.customer?.id ?? null;
-      if (!ownsPayment(req.user!, { customer, metadata: session.metadata })) return res.status(403).json({ error: "Forbidden" });
-      if (session.mode !== "payment" || session.status !== "complete" || session.payment_status !== "paid" || !session.amount_total || session.currency !== "usd") {
+      const result = await settleCheckoutSession(sessionId, req.user!.id);
+      if (!result.success) {
+        if (result.reason === "forbidden") return res.status(403).json({ error: "Forbidden" });
+        if (result.reason === "invalid") return res.status(409).json({ error: "Payment requires reconciliation" });
         return res.json({ success: false, message: "Payment not completed" });
       }
-
-      const existingTx = await storage.getCreditTransactions(req.user!.id);
-      const alreadyProcessed = existingTx.some(tx => tx.stripeSessionId === sessionId);
-      if (alreadyProcessed) {
-        const user = await storage.getUser(req.user!.id);
-        return res.json({ success: true, credits: user?.reviewCredits ?? 0, alreadyProcessed: true });
-      }
-
-      const credits = parseCreditAmount(session.metadata?.credits);
-      if (credits === null || !session.metadata?.priceId || !session.metadata?.productId) return res.status(409).json({ error: "Payment requires reconciliation" });
-      const lineItems = await stripe.checkout.sessions.listLineItems(sessionId, { limit: 2 });
-      const item = lineItems.data[0];
-      if (lineItems.has_more || lineItems.data.length !== 1 || !item || !item.price || item.quantity !== 1 || item.price.id !== session.metadata.priceId || (typeof item.price.product === "string" ? item.price.product : item.price.product?.id) !== session.metadata.productId || item.amount_total !== session.amount_total) return res.status(409).json({ error: "Payment requires reconciliation" });
-      const { user: updatedUser } = await storage.addCredits(
-        req.user!.id,
-        credits,
-        `Purchased ${credits} review credit${credits > 1 ? "s" : ""}`,
-        sessionId
-      );
-
-      await storage.createAuditLog({
-        tenantId: req.user!.tenantId,
-        userId: req.user!.id,
-        action: "credits_purchased",
-        resourceType: "credits",
-        resourceId: sessionId,
-        details: { credits, sessionId },
-        ipAddress: getIp(req),
-      });
-
-      res.json({ success: true, credits: updatedUser.reviewCredits });
+      res.json(result);
     } catch (e: any) {
       if (e instanceof PaymentOwnershipError) return res.status(403).json({ error: "Forbidden" });
       res.status(500).json({ error: "Internal server error" });

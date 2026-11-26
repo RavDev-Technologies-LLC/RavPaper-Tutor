@@ -44,7 +44,7 @@ async function initStripe() {
     }
 
     console.log('Syncing Stripe data...');
-    stripeSync.syncBackfill()
+    stripeSync.syncBackfill({ object: 'all' })
       .then(() => console.log('Stripe data synced'))
       .catch((err: any) => console.error('Error syncing Stripe data:', err));
   } catch (error) {

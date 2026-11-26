@@ -1,0 +1,1 @@
+- [Stripe sync backfill scope](stripe-sync-backfill.md) — specify `object: "all"` or a target; an empty options call may report success without syncing catalog records.

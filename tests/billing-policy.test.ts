@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseCreditAmount, ownsPayment, validCatalogPrice } from "../server/billing-policy.ts";
+import { isCreditSettlementEvent } from "../server/payment-settlement.ts";
 const user = { id: "user-a", tenantId: 1, stripeCustomerId: "customer-a" };
 const session = { customer: "customer-a", metadata: { userId: "user-a", tenantId: "1" } };
 const price = { active: true, type: "one_time", unit_amount: 499, currency: "usd", product: "product-a", livemode: false };
@@ -36,4 +37,11 @@ test("only the four configured one-time credit package prices are accepted", () 
     assert.equal(validCatalogPrice({ ...price, unit_amount: amount }, productForPackage), true);
     assert.equal(validCatalogPrice({ ...price, unit_amount: amount + 1 }, productForPackage), false);
   }
+});
+
+test("only completed and asynchronously successful checkout events trigger settlement", () => {
+  assert.equal(isCreditSettlementEvent("checkout.session.completed"), true);
+  assert.equal(isCreditSettlementEvent("checkout.session.async_payment_succeeded"), true);
+  assert.equal(isCreditSettlementEvent("checkout.session.async_payment_failed"), false);
+  assert.equal(isCreditSettlementEvent("payment_intent.succeeded"), false);
 });
