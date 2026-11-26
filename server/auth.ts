@@ -3,6 +3,7 @@ import jwt from "jsonwebtoken";
 import type { Request, Response, NextFunction } from "express";
 import { storage } from "./storage";
 import type { User } from "@shared/schema";
+import { tokenHasPurpose } from "./security-policy";
 
 const JWT_SECRET = process.env.SESSION_SECRET!;
 const ACCESS_TOKEN_EXPIRY = "15m";
@@ -18,7 +19,7 @@ export function comparePassword(password: string, hash: string): Promise<boolean
 
 export function generateAccessToken(user: User): string {
   return jwt.sign(
-    { userId: user.id, tenantId: user.tenantId, role: user.role },
+    { userId: user.id, type: "access", tenantId: user.tenantId, role: user.role },
     JWT_SECRET,
     { expiresIn: ACCESS_TOKEN_EXPIRY }
   );
@@ -45,9 +46,11 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
   const header = req.headers.authorization;
   if (!header?.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
   try {
-    const payload = jwt.verify(header.slice(7), JWT_SECRET) as any;
+    const payload = jwt.verify(header.slice(7), JWT_SECRET, { algorithms: ["HS256"] });
+    if (!tokenHasPurpose(payload, "access")) return res.status(401).json({ error: "Invalid access token" });
     const user = await storage.getUser(payload.userId);
     if (!user || !user.isActive) return res.status(401).json({ error: "Unauthorized" });
+    if (user.tenantId === null || !(await storage.getTenant(user.tenantId))?.isActive) return res.status(403).json({ error: "Tenant unavailable" });
     req.user = user;
     req.tenantId = user.tenantId ?? undefined;
     next();

@@ -2,6 +2,7 @@ import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "http";
+import { randomUUID } from "node:crypto";
 import { runMigrations } from 'stripe-replit-sync';
 import { getStripeSync } from './stripeClient';
 import { WebhookHandlers } from './webhookHandlers';
@@ -69,7 +70,7 @@ app.post(
       await WebhookHandlers.processWebhook(req.body as Buffer, sig);
       res.status(200).json({ received: true });
     } catch (error: any) {
-      console.error('Webhook error:', error.message);
+      console.error(JSON.stringify({ event: 'webhook_error' }));
       res.status(400).json({ error: 'Webhook processing error' });
     }
   }
@@ -99,27 +100,13 @@ export function log(message: string, source = "express") {
 
 app.use((req, res, next) => {
   const start = Date.now();
-  const path = req.path;
-  let capturedJsonResponse: Record<string, any> | undefined = undefined;
-
-  const originalResJson = res.json;
-  res.json = function (bodyJson, ...args) {
-    capturedJsonResponse = bodyJson;
-    return originalResJson.apply(res, [bodyJson, ...args]);
-  };
-
+  const requestId = randomUUID();
+  res.setHeader("X-Request-ID", requestId);
   res.on("finish", () => {
-    const duration = Date.now() - start;
-    if (path.startsWith("/api")) {
-      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
-      if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
-      }
-
-      log(logLine);
+    if (req.path.startsWith("/api")) {
+      console.log(JSON.stringify({ event: "api_request", requestId, method: req.method, status: res.statusCode, durationMs: Date.now() - start }));
     }
   });
-
   next();
 });
 
@@ -128,9 +115,9 @@ app.use((req, res, next) => {
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
-    const message = err.message || "Internal Server Error";
+    const message = status >= 500 ? "Internal Server Error" : "Invalid request";
 
-    console.error("Internal Server Error:", err);
+    console.error(JSON.stringify({ event: "request_error", status }));
 
     if (res.headersSent) {
       return next(err);

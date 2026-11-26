@@ -10,6 +10,7 @@ import {
   generateRefreshToken,
 } from "./auth";
 import jwt from "jsonwebtoken";
+import { ownsDocument, canReadRubric, canChangeRole, tokenHasPurpose } from "./security-policy";
 import {
   runPlagiarismEngine,
   runRubricEngine,
@@ -62,9 +63,6 @@ export async function registerRoutes(
       const existingUsername = await storage.getUserByUsername(username);
       if (existingUsername) return res.status(409).json({ error: "Username already taken" });
 
-      const allTenants = await storage.getAllTenants();
-      const isFirstUser = allTenants.length === 0;
-
       const slug = username.toLowerCase().replace(/[^a-z0-9]/g, "-");
       const tenant = await storage.createTenant({
         name: `${fullName}'s Organization`,
@@ -80,7 +78,7 @@ export async function registerRoutes(
         email,
         password: hashedPassword,
         fullName,
-        role: isFirstUser ? "super_admin" : "student",
+        role: "student",
         isActive: true,
       });
 
@@ -101,7 +99,7 @@ export async function registerRoutes(
         refreshToken: generateRefreshToken(user),
       });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -133,7 +131,7 @@ export async function registerRoutes(
         refreshToken: generateRefreshToken(user),
       });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -142,8 +140,8 @@ export async function registerRoutes(
       const { refreshToken } = req.body;
       if (!refreshToken) return res.status(400).json({ error: "Refresh token required" });
 
-      const payload = jwt.verify(refreshToken, JWT_SECRET) as any;
-      if (payload.type !== "refresh") return res.status(401).json({ error: "Invalid token type" });
+      const payload = jwt.verify(refreshToken, JWT_SECRET, { algorithms: ["HS256"] });
+      if (!tokenHasPurpose(payload, "refresh")) return res.status(401).json({ error: "Invalid token type" });
 
       const user = await storage.getUser(payload.userId);
       if (!user || !user.isActive) return res.status(401).json({ error: "Unauthorized" });
@@ -168,7 +166,7 @@ export async function registerRoutes(
       const docs = await storage.getDocumentsByUser(req.user!.id);
       res.json(docs);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -204,7 +202,7 @@ export async function registerRoutes(
 
       res.status(201).json(doc);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -212,12 +210,12 @@ export async function registerRoutes(
     try {
       const doc = await storage.getDocument(Number(req.params.id));
       if (!doc) return res.status(404).json({ error: "Document not found" });
-      if (doc.userId !== req.user!.id && req.user!.role === "student") {
+      if (!ownsDocument(req.user!, doc)) {
         return res.status(403).json({ error: "Forbidden" });
       }
       res.json(doc);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -225,7 +223,7 @@ export async function registerRoutes(
     try {
       const doc = await storage.getDocument(Number(req.params.id));
       if (!doc) return res.status(404).json({ error: "Document not found" });
-      if (doc.userId !== req.user!.id && req.user!.role === "student") {
+      if (!ownsDocument(req.user!, doc)) {
         return res.status(403).json({ error: "Forbidden" });
       }
       await storage.deleteDocument(doc.id);
@@ -241,7 +239,7 @@ export async function registerRoutes(
 
       res.status(204).send();
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -250,10 +248,11 @@ export async function registerRoutes(
       const docId = Number(req.params.id);
       const doc = await storage.getDocument(docId);
       if (!doc) return res.status(404).json({ error: "Document not found" });
+      if (!ownsDocument(req.user!, doc)) return res.status(403).json({ error: "Forbidden" });
       const anns = await storage.getAnnotationsByDocument(docId);
       res.json(anns);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -261,24 +260,25 @@ export async function registerRoutes(
   app.get("/api/rubrics", authMiddleware, async (req, res) => {
     try {
       const tenantRubrics = req.tenantId ? await storage.getRubricsByTenant(req.tenantId) : [];
-      const templates = await storage.getRubricTemplates();
+      const templates = (await storage.getRubricTemplates()).filter(r => canReadRubric(req.user!, r));
       const combined = [...tenantRubrics];
       for (const t of templates) {
         if (!combined.find((r) => r.id === t.id)) combined.push(t);
       }
       res.json(combined);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
   app.post("/api/rubrics", authMiddleware, async (req, res) => {
     try {
       const { name, submissionType, criteria, isTemplate } = req.body;
-      if (!name || !criteria) return res.status(400).json({ error: "Name and criteria required" });
+      if (typeof name !== "string" || !name.trim() || !Array.isArray(criteria) || !criteria.length) return res.status(400).json({ error: "Name and criteria required" });
+      if (isTemplate && req.user!.role !== "super_admin") return res.status(403).json({ error: "Forbidden" });
 
       const rubric = await storage.createRubric({
-        tenantId: req.user!.tenantId,
+        tenantId: isTemplate ? null : req.user!.tenantId,
         name,
         submissionType: submissionType || null,
         criteria,
@@ -288,7 +288,7 @@ export async function registerRoutes(
 
       res.status(201).json(rubric);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -296,9 +296,10 @@ export async function registerRoutes(
     try {
       const rubric = await storage.getRubric(Number(req.params.id));
       if (!rubric) return res.status(404).json({ error: "Rubric not found" });
+      if (!canReadRubric(req.user!, rubric)) return res.status(403).json({ error: "Forbidden" });
       res.json(rubric);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -308,6 +309,7 @@ export async function registerRoutes(
       const documentId = Number(req.params.documentId);
       const doc = await storage.getDocument(documentId);
       if (!doc) return res.status(404).json({ error: "Document not found" });
+      if (!ownsDocument(req.user!, doc)) return res.status(403).json({ error: "Forbidden" });
       if (!doc.fileContent) return res.status(400).json({ error: "Document has no content to analyze" });
 
       const currentUser = await storage.getUser(req.user!.id);
@@ -320,7 +322,13 @@ export async function registerRoutes(
       }
 
       const { rubricId, engines } = req.body || {};
-      const engineList: string[] = engines && engines.length > 0 ? engines : ALL_ENGINES;
+      if (engines !== undefined && (!Array.isArray(engines) || !engines.length || engines.length > ALL_ENGINES.length || engines.some((engine: unknown) => typeof engine !== "string" || !ALL_ENGINES.includes(engine)) || new Set(engines).size !== engines.length)) return res.status(400).json({ error: "Invalid analysis engine selection" });
+      const engineList: string[] = engines ?? ALL_ENGINES;
+      if (rubricId !== undefined && rubricId !== null) {
+        if (!Number.isSafeInteger(rubricId) || rubricId < 1) return res.status(400).json({ error: "Invalid rubric" });
+        const selectedRubric = await storage.getRubric(rubricId);
+        if (!selectedRubric || !canReadRubric(req.user!, selectedRubric)) return res.status(403).json({ error: "Rubric unavailable" });
+      }
 
       await storage.deductCredit(req.user!.id, documentId, `Analysis of "${doc.title}"`);
 
@@ -432,17 +440,20 @@ export async function registerRoutes(
 
       res.json({ results, aggregated });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
   app.get("/api/analysis/results/:documentId", authMiddleware, async (req, res) => {
     try {
       const documentId = Number(req.params.documentId);
+      const doc = await storage.getDocument(documentId);
+      if (!doc) return res.status(404).json({ error: "Document not found" });
+      if (!ownsDocument(req.user!, doc)) return res.status(403).json({ error: "Forbidden" });
       const results = await storage.getResultsByDocument(documentId);
       res.json(results);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -451,6 +462,7 @@ export async function registerRoutes(
       const documentId = Number(req.params.documentId);
       const doc = await storage.getDocument(documentId);
       if (!doc) return res.status(404).json({ error: "Document not found" });
+      if (!ownsDocument(req.user!, doc)) return res.status(403).json({ error: "Forbidden" });
       if (!doc.fileContent) return res.status(400).json({ error: "Document has no content" });
 
       const questionsResult = await generateDefenseQuestions(doc.fileContent);
@@ -477,7 +489,7 @@ export async function registerRoutes(
 
       res.status(201).json(session);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -491,7 +503,7 @@ export async function registerRoutes(
 
       const session = await storage.getDefenseSession(sessionId);
       if (!session) return res.status(404).json({ error: "Session not found" });
-      if (session.userId !== req.user!.id) return res.status(403).json({ error: "Forbidden" });
+      if (!ownsDocument(req.user!, session)) return res.status(403).json({ error: "Forbidden" });
 
       const questions = (session.questions as any[]) || [];
       if (questionIndex < 0 || questionIndex >= questions.length) {
@@ -499,7 +511,8 @@ export async function registerRoutes(
       }
 
       const doc = await storage.getDocument(session.documentId!);
-      const docContent = doc?.fileContent || "";
+      if (!doc || !ownsDocument(req.user!, doc)) return res.status(403).json({ error: "Forbidden" });
+      const docContent = doc.fileContent || "";
       const question = questions[questionIndex].question;
 
       const evaluation = await evaluateDefenseAnswer(question, answer, docContent);
@@ -520,7 +533,7 @@ export async function registerRoutes(
 
       res.json({ evaluation, progress: { answered: answeredCount, total: questions.length, overallScore: avgScore } });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -534,7 +547,7 @@ export async function registerRoutes(
       const safe = usersList.map(({ password: _, ...u }) => u);
       res.json(safe);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -547,7 +560,7 @@ export async function registerRoutes(
 
       const targetUser = await storage.getUser(req.params.id);
       if (!targetUser) return res.status(404).json({ error: "User not found" });
-      if (targetUser.tenantId !== req.tenantId) return res.status(403).json({ error: "Forbidden" });
+      if (!canChangeRole(req.user!, targetUser, role)) return res.status(403).json({ error: "Forbidden" });
 
       const updated = await storage.updateUser(req.params.id, { role } as any);
 
@@ -568,7 +581,7 @@ export async function registerRoutes(
         res.status(404).json({ error: "User not found" });
       }
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -578,7 +591,7 @@ export async function registerRoutes(
       const logs = await storage.getAuditLogsByTenant(req.tenantId);
       res.json(logs);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -598,7 +611,7 @@ export async function registerRoutes(
         analysisCount,
       });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -608,7 +621,7 @@ export async function registerRoutes(
       const user = await storage.getUser(req.user!.id);
       res.json({ credits: user?.reviewCredits ?? 0 });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -617,7 +630,7 @@ export async function registerRoutes(
       const transactions = await storage.getCreditTransactions(req.user!.id);
       res.json(transactions);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -662,7 +675,7 @@ export async function registerRoutes(
 
       res.json(Array.from(productsMap.values()));
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -671,7 +684,7 @@ export async function registerRoutes(
       const key = await getStripePublishableKey();
       res.json({ publishableKey: key });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -719,7 +732,7 @@ export async function registerRoutes(
 
       res.json({ url: session.url });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -762,7 +775,7 @@ export async function registerRoutes(
 
       res.json({ success: true, credits: updatedUser.reviewCredits });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
