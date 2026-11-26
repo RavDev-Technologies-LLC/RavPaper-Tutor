@@ -95,6 +95,9 @@ export default function AnalysisPage() {
       toast({ title: "Analysis Complete", description: "All engines have completed their analysis." });
     },
     onError: (error: any) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/documents", documentId] });
+      queryClient.invalidateQueries({ queryKey: ["/api/analysis/results", documentId] });
+      queryClient.invalidateQueries({ queryKey: ["/api/credits/balance"] });
       toast({ title: "Analysis Failed", description: error.message, variant: "destructive" });
     },
   });
