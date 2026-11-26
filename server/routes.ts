@@ -1,6 +1,7 @@
 import type { Express } from "express";
 import type { Server } from "http";
-import { storage } from "./storage";
+import { storage, InsufficientCreditsError, PaymentOwnershipError, AnalysisInProgressError } from "./storage";
+import { ownsPayment, parseCreditAmount, validCatalogPrice } from "./billing-policy";
 import {
   authMiddleware,
   requireRole,
@@ -10,6 +11,7 @@ import {
   generateRefreshToken,
 } from "./auth";
 import jwt from "jsonwebtoken";
+import { ownsDocument, canReadRubric, canChangeRole, tokenHasPurpose } from "./security-policy";
 import {
   runPlagiarismEngine,
   runRubricEngine,
@@ -62,9 +64,6 @@ export async function registerRoutes(
       const existingUsername = await storage.getUserByUsername(username);
       if (existingUsername) return res.status(409).json({ error: "Username already taken" });
 
-      const allTenants = await storage.getAllTenants();
-      const isFirstUser = allTenants.length === 0;
-
       const slug = username.toLowerCase().replace(/[^a-z0-9]/g, "-");
       const tenant = await storage.createTenant({
         name: `${fullName}'s Organization`,
@@ -80,7 +79,7 @@ export async function registerRoutes(
         email,
         password: hashedPassword,
         fullName,
-        role: isFirstUser ? "super_admin" : "student",
+        role: "student",
         isActive: true,
       });
 
@@ -101,7 +100,7 @@ export async function registerRoutes(
         refreshToken: generateRefreshToken(user),
       });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -133,7 +132,7 @@ export async function registerRoutes(
         refreshToken: generateRefreshToken(user),
       });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -142,8 +141,8 @@ export async function registerRoutes(
       const { refreshToken } = req.body;
       if (!refreshToken) return res.status(400).json({ error: "Refresh token required" });
 
-      const payload = jwt.verify(refreshToken, JWT_SECRET) as any;
-      if (payload.type !== "refresh") return res.status(401).json({ error: "Invalid token type" });
+      const payload = jwt.verify(refreshToken, JWT_SECRET, { algorithms: ["HS256"] });
+      if (!tokenHasPurpose(payload, "refresh")) return res.status(401).json({ error: "Invalid token type" });
 
       const user = await storage.getUser(payload.userId);
       if (!user || !user.isActive) return res.status(401).json({ error: "Unauthorized" });
@@ -168,7 +167,7 @@ export async function registerRoutes(
       const docs = await storage.getDocumentsByUser(req.user!.id);
       res.json(docs);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -204,7 +203,7 @@ export async function registerRoutes(
 
       res.status(201).json(doc);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -212,12 +211,12 @@ export async function registerRoutes(
     try {
       const doc = await storage.getDocument(Number(req.params.id));
       if (!doc) return res.status(404).json({ error: "Document not found" });
-      if (doc.userId !== req.user!.id && req.user!.role === "student") {
+      if (!ownsDocument(req.user!, doc)) {
         return res.status(403).json({ error: "Forbidden" });
       }
       res.json(doc);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -225,7 +224,7 @@ export async function registerRoutes(
     try {
       const doc = await storage.getDocument(Number(req.params.id));
       if (!doc) return res.status(404).json({ error: "Document not found" });
-      if (doc.userId !== req.user!.id && req.user!.role === "student") {
+      if (!ownsDocument(req.user!, doc)) {
         return res.status(403).json({ error: "Forbidden" });
       }
       await storage.deleteDocument(doc.id);
@@ -241,7 +240,7 @@ export async function registerRoutes(
 
       res.status(204).send();
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -250,10 +249,11 @@ export async function registerRoutes(
       const docId = Number(req.params.id);
       const doc = await storage.getDocument(docId);
       if (!doc) return res.status(404).json({ error: "Document not found" });
+      if (!ownsDocument(req.user!, doc)) return res.status(403).json({ error: "Forbidden" });
       const anns = await storage.getAnnotationsByDocument(docId);
       res.json(anns);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -261,24 +261,25 @@ export async function registerRoutes(
   app.get("/api/rubrics", authMiddleware, async (req, res) => {
     try {
       const tenantRubrics = req.tenantId ? await storage.getRubricsByTenant(req.tenantId) : [];
-      const templates = await storage.getRubricTemplates();
+      const templates = (await storage.getRubricTemplates()).filter(r => canReadRubric(req.user!, r));
       const combined = [...tenantRubrics];
       for (const t of templates) {
         if (!combined.find((r) => r.id === t.id)) combined.push(t);
       }
       res.json(combined);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
   app.post("/api/rubrics", authMiddleware, async (req, res) => {
     try {
       const { name, submissionType, criteria, isTemplate } = req.body;
-      if (!name || !criteria) return res.status(400).json({ error: "Name and criteria required" });
+      if (typeof name !== "string" || !name.trim() || !Array.isArray(criteria) || !criteria.length) return res.status(400).json({ error: "Name and criteria required" });
+      if (isTemplate && req.user!.role !== "super_admin") return res.status(403).json({ error: "Forbidden" });
 
       const rubric = await storage.createRubric({
-        tenantId: req.user!.tenantId,
+        tenantId: isTemplate ? null : req.user!.tenantId,
         name,
         submissionType: submissionType || null,
         criteria,
@@ -288,7 +289,7 @@ export async function registerRoutes(
 
       res.status(201).json(rubric);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -296,18 +297,23 @@ export async function registerRoutes(
     try {
       const rubric = await storage.getRubric(Number(req.params.id));
       if (!rubric) return res.status(404).json({ error: "Rubric not found" });
+      if (!canReadRubric(req.user!, rubric)) return res.status(403).json({ error: "Forbidden" });
       res.json(rubric);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
   // ─── Analysis Routes ───────────────────────────────────────────
   app.post("/api/analysis/run/:documentId", authMiddleware, async (req, res) => {
+    let usageId: number | undefined;
+    let currentResultId: number | undefined;
+    let finalized = false;
     try {
       const documentId = Number(req.params.documentId);
       const doc = await storage.getDocument(documentId);
       if (!doc) return res.status(404).json({ error: "Document not found" });
+      if (!ownsDocument(req.user!, doc)) return res.status(403).json({ error: "Forbidden" });
       if (!doc.fileContent) return res.status(400).json({ error: "Document has no content to analyze" });
 
       const currentUser = await storage.getUser(req.user!.id);
@@ -320,11 +326,16 @@ export async function registerRoutes(
       }
 
       const { rubricId, engines } = req.body || {};
-      const engineList: string[] = engines && engines.length > 0 ? engines : ALL_ENGINES;
+      if (engines !== undefined && (!Array.isArray(engines) || !engines.length || engines.length > ALL_ENGINES.length || engines.some((engine: unknown) => typeof engine !== "string" || !ALL_ENGINES.includes(engine)) || new Set(engines).size !== engines.length)) return res.status(400).json({ error: "Invalid analysis engine selection" });
+      const engineList: string[] = engines ?? ALL_ENGINES;
+      if (rubricId !== undefined && rubricId !== null) {
+        if (!Number.isSafeInteger(rubricId) || rubricId < 1) return res.status(400).json({ error: "Invalid rubric" });
+        const selectedRubric = await storage.getRubric(rubricId);
+        if (!selectedRubric || !canReadRubric(req.user!, selectedRubric)) return res.status(403).json({ error: "Rubric unavailable" });
+      }
 
-      await storage.deductCredit(req.user!.id, documentId, `Analysis of "${doc.title}"`);
-
-      await storage.updateDocument(documentId, { status: "processing" } as any);
+      try { const debit = await storage.deductCredit(req.user!.id, documentId, `Analysis of "${doc.title}"`); usageId = debit.transaction.id; }
+      catch (error) { if (error instanceof InsufficientCreditsError) return res.status(402).json({ error: "Insufficient review credits" }); if (error instanceof AnalysisInProgressError) return res.status(409).json({ error: "Document unavailable or already processing" }); throw error; }
 
       await storage.createAuditLog({
         tenantId: req.user!.tenantId,
@@ -356,6 +367,7 @@ export async function registerRoutes(
           details: null,
         });
 
+        currentResultId = record.id;
         let engineResult: any;
         try {
           switch (engine) {
@@ -378,15 +390,15 @@ export async function registerRoutes(
               engineResult = await runFormattingEngine(content);
               break;
             default:
-              engineResult = { score: 0, findings: [], summary: "Unknown engine" };
+              throw new Error("Unknown engine");
           }
-        } catch (err: any) {
-          engineResult = { score: 0, findings: [], summary: `Error: ${err.message}` };
+        } catch {
+          throw new Error("Analysis engine failed");
         }
 
         const updated = await storage.updateAnalysisResult(record.id, {
           status: "completed",
-          score: engineResult.score || 0,
+          score: engineResult.score,
           results: engineResult,
         });
 
@@ -408,7 +420,9 @@ export async function registerRoutes(
           await storage.createManyAnnotations(annotationBatch);
         }
 
+        if (!updated) throw new Error("Analysis result unavailable");
         results.push(updated);
+        currentResultId = undefined;
       }
 
       const aggregated = runScoringAggregator(
@@ -420,6 +434,7 @@ export async function registerRoutes(
         metadata: aggregated,
       } as any);
 
+      finalized = true;
       await storage.createAuditLog({
         tenantId: req.user!.tenantId,
         userId: req.user!.id,
@@ -432,17 +447,25 @@ export async function registerRoutes(
 
       res.json({ results, aggregated });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      if (usageId !== undefined && !finalized) {
+        try { await storage.refundFailedAnalysis(req.user!.id, usageId, currentResultId); }
+        catch { console.error(JSON.stringify({ event: "analysis_refund_failed", usageId })); return res.status(503).json({ error: "Analysis failed; credit reconciliation required" }); }
+        return res.status(502).json({ error: "Analysis failed; review credit restored" });
+      }
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
   app.get("/api/analysis/results/:documentId", authMiddleware, async (req, res) => {
     try {
       const documentId = Number(req.params.documentId);
+      const doc = await storage.getDocument(documentId);
+      if (!doc) return res.status(404).json({ error: "Document not found" });
+      if (!ownsDocument(req.user!, doc)) return res.status(403).json({ error: "Forbidden" });
       const results = await storage.getResultsByDocument(documentId);
       res.json(results);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -451,6 +474,7 @@ export async function registerRoutes(
       const documentId = Number(req.params.documentId);
       const doc = await storage.getDocument(documentId);
       if (!doc) return res.status(404).json({ error: "Document not found" });
+      if (!ownsDocument(req.user!, doc)) return res.status(403).json({ error: "Forbidden" });
       if (!doc.fileContent) return res.status(400).json({ error: "Document has no content" });
 
       const questionsResult = await generateDefenseQuestions(doc.fileContent);
@@ -477,7 +501,7 @@ export async function registerRoutes(
 
       res.status(201).json(session);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -485,13 +509,13 @@ export async function registerRoutes(
     try {
       const sessionId = Number(req.params.sessionId);
       const { questionIndex, answer } = req.body;
-      if (questionIndex === undefined || !answer) {
+      if (!Number.isSafeInteger(questionIndex) || typeof answer !== "string" || !answer.trim() || answer.length > 20000) {
         return res.status(400).json({ error: "questionIndex and answer are required" });
       }
 
       const session = await storage.getDefenseSession(sessionId);
       if (!session) return res.status(404).json({ error: "Session not found" });
-      if (session.userId !== req.user!.id) return res.status(403).json({ error: "Forbidden" });
+      if (!ownsDocument(req.user!, session)) return res.status(403).json({ error: "Forbidden" });
 
       const questions = (session.questions as any[]) || [];
       if (questionIndex < 0 || questionIndex >= questions.length) {
@@ -499,7 +523,8 @@ export async function registerRoutes(
       }
 
       const doc = await storage.getDocument(session.documentId!);
-      const docContent = doc?.fileContent || "";
+      if (!doc || !ownsDocument(req.user!, doc)) return res.status(403).json({ error: "Forbidden" });
+      const docContent = doc.fileContent || "";
       const question = questions[questionIndex].question;
 
       const evaluation = await evaluateDefenseAnswer(question, answer, docContent);
@@ -520,7 +545,7 @@ export async function registerRoutes(
 
       res.json({ evaluation, progress: { answered: answeredCount, total: questions.length, overallScore: avgScore } });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -534,7 +559,7 @@ export async function registerRoutes(
       const safe = usersList.map(({ password: _, ...u }) => u);
       res.json(safe);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -547,7 +572,7 @@ export async function registerRoutes(
 
       const targetUser = await storage.getUser(req.params.id);
       if (!targetUser) return res.status(404).json({ error: "User not found" });
-      if (targetUser.tenantId !== req.tenantId) return res.status(403).json({ error: "Forbidden" });
+      if (!canChangeRole(req.user!, targetUser, role)) return res.status(403).json({ error: "Forbidden" });
 
       const updated = await storage.updateUser(req.params.id, { role } as any);
 
@@ -568,7 +593,7 @@ export async function registerRoutes(
         res.status(404).json({ error: "User not found" });
       }
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -578,7 +603,7 @@ export async function registerRoutes(
       const logs = await storage.getAuditLogsByTenant(req.tenantId);
       res.json(logs);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -598,7 +623,7 @@ export async function registerRoutes(
         analysisCount,
       });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -608,7 +633,7 @@ export async function registerRoutes(
       const user = await storage.getUser(req.user!.id);
       res.json({ credits: user?.reviewCredits ?? 0 });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -617,7 +642,7 @@ export async function registerRoutes(
       const transactions = await storage.getCreditTransactions(req.user!.id);
       res.json(transactions);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -662,7 +687,7 @@ export async function registerRoutes(
 
       res.json(Array.from(productsMap.values()));
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
@@ -671,38 +696,42 @@ export async function registerRoutes(
       const key = await getStripePublishableKey();
       res.json({ publishableKey: key });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
   app.post("/api/stripe/checkout", authMiddleware, async (req, res) => {
     try {
       const { priceId, productId } = req.body;
-      if (!priceId || !productId) {
+      if (typeof priceId !== "string" || typeof productId !== "string" || !priceId || !productId) {
         return res.status(400).json({ error: "priceId and productId are required" });
       }
 
       const stripe = await getUncachableStripeClient();
       const user = req.user!;
+      const price = await stripe.prices.retrieve(priceId);
+      const product = await stripe.products.retrieve(productId);
+      const productOfPrice = typeof price.product === "string" ? price.product : price.product.id;
+      if (!validCatalogPrice({ ...price, product: productOfPrice }, product)) return res.status(400).json({ error: "Invalid credit package" });
+      if (price.livemode && process.env.STRIPE_LIVE_CHARGING_ENABLED !== "true") return res.status(503).json({ error: "Live payments disabled" });
+      const credits = parseCreditAmount(product.metadata.credits)!;
+      const configuredOrigin = process.env.APP_BASE_URL;
+      if (!configuredOrigin) return res.status(503).json({ error: "Payment configuration unavailable" });
+      const origin = new URL(configuredOrigin);
+      if (origin.protocol !== "https:" && !(process.env.NODE_ENV !== "production" && origin.protocol === "http:" && ["localhost", "127.0.0.1"].includes(origin.hostname))) return res.status(503).json({ error: "Invalid payment configuration" });
+      const baseUrl = origin.origin;
 
       let customerId = user.stripeCustomerId;
       if (!customerId) {
         const customer = await stripe.customers.create({
           email: user.email,
           name: user.fullName,
-          metadata: { userId: user.id },
-        });
+          metadata: { userId: user.id, tenantId: String(user.tenantId) },
+        }, { idempotencyKey: `ravpaper-customer-${user.id}` });
         customerId = customer.id;
         await storage.updateUser(user.id, { stripeCustomerId: customerId } as any);
       }
 
-      const productResult = await db.execute(sql`
-        SELECT metadata FROM stripe.products WHERE id = ${productId}
-      `);
-      const productMeta = (productResult.rows[0] as any)?.metadata;
-      const credits = productMeta?.credits ? parseInt(productMeta.credits) : 1;
-
-      const baseUrl = `${req.protocol}://${req.get("host")}`;
       const session = await stripe.checkout.sessions.create({
         customer: customerId,
         payment_method_types: ["card"],
@@ -712,26 +741,30 @@ export async function registerRoutes(
         cancel_url: `${baseUrl}/pricing?canceled=true`,
         metadata: {
           userId: user.id,
+          tenantId: String(user.tenantId),
           credits: String(credits),
           productId,
+          priceId,
         },
       });
 
       res.json({ url: session.url });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
   app.post("/api/stripe/verify-session", authMiddleware, async (req, res) => {
     try {
       const { sessionId } = req.body;
-      if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+      if (typeof sessionId !== "string" || !sessionId || sessionId.length > 256) return res.status(400).json({ error: "sessionId required" });
 
       const stripe = await getUncachableStripeClient();
       const session = await stripe.checkout.sessions.retrieve(sessionId);
 
-      if (session.payment_status !== "paid") {
+      const customer = typeof session.customer === "string" ? session.customer : session.customer?.id ?? null;
+      if (!ownsPayment(req.user!, { customer, metadata: session.metadata })) return res.status(403).json({ error: "Forbidden" });
+      if (session.mode !== "payment" || session.status !== "complete" || session.payment_status !== "paid" || !session.amount_total || session.currency !== "usd") {
         return res.json({ success: false, message: "Payment not completed" });
       }
 
@@ -742,7 +775,11 @@ export async function registerRoutes(
         return res.json({ success: true, credits: user?.reviewCredits ?? 0, alreadyProcessed: true });
       }
 
-      const credits = session.metadata?.credits ? parseInt(session.metadata.credits) : 1;
+      const credits = parseCreditAmount(session.metadata?.credits);
+      if (credits === null || !session.metadata?.priceId || !session.metadata?.productId) return res.status(409).json({ error: "Payment requires reconciliation" });
+      const lineItems = await stripe.checkout.sessions.listLineItems(sessionId, { limit: 2 });
+      const item = lineItems.data[0];
+      if (lineItems.has_more || lineItems.data.length !== 1 || !item || !item.price || item.quantity !== 1 || item.price.id !== session.metadata.priceId || (typeof item.price.product === "string" ? item.price.product : item.price.product?.id) !== session.metadata.productId || item.amount_total !== session.amount_total) return res.status(409).json({ error: "Payment requires reconciliation" });
       const { user: updatedUser } = await storage.addCredits(
         req.user!.id,
         credits,
@@ -762,7 +799,8 @@ export async function registerRoutes(
 
       res.json({ success: true, credits: updatedUser.reviewCredits });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      if (e instanceof PaymentOwnershipError) return res.status(403).json({ error: "Forbidden" });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 
