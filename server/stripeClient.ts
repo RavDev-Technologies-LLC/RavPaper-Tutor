@@ -30,6 +30,7 @@ async function getCredentials() {
     }
   });
 
+  if (!response.ok) throw new Error('Stripe connection unavailable');
   const data = await response.json();
   connectionSettings = data.items?.[0];
 

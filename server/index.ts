@@ -50,7 +50,8 @@ async function initStripe() {
   }
 }
 
-await initStripe();
+// Explicit development provisioning only; production startup must not modify Stripe or database schema.
+if (process.env.NODE_ENV !== 'production' && process.env.REPLIT_DEPLOYMENT !== '1' && process.env.STRIPE_DEV_PROVISION === 'true') await initStripe();
 
 app.post(
   '/api/stripe/webhook',

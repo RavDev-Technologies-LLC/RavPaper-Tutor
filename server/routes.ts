@@ -1,6 +1,7 @@
 import type { Express } from "express";
 import type { Server } from "http";
-import { storage } from "./storage";
+import { storage, InsufficientCreditsError, PaymentOwnershipError } from "./storage";
+import { ownsPayment, parseCreditAmount, validCatalogPrice } from "./billing-policy";
 import {
   authMiddleware,
   requireRole,
@@ -330,7 +331,8 @@ export async function registerRoutes(
         if (!selectedRubric || !canReadRubric(req.user!, selectedRubric)) return res.status(403).json({ error: "Rubric unavailable" });
       }
 
-      await storage.deductCredit(req.user!.id, documentId, `Analysis of "${doc.title}"`);
+      try { await storage.deductCredit(req.user!.id, documentId, `Analysis of "${doc.title}"`); }
+      catch (error) { if (error instanceof InsufficientCreditsError) return res.status(402).json({ error: "Insufficient review credits" }); throw error; }
 
       await storage.updateDocument(documentId, { status: "processing" } as any);
 
@@ -691,31 +693,35 @@ export async function registerRoutes(
   app.post("/api/stripe/checkout", authMiddleware, async (req, res) => {
     try {
       const { priceId, productId } = req.body;
-      if (!priceId || !productId) {
+      if (typeof priceId !== "string" || typeof productId !== "string" || !priceId || !productId) {
         return res.status(400).json({ error: "priceId and productId are required" });
       }
 
       const stripe = await getUncachableStripeClient();
       const user = req.user!;
+      const price = await stripe.prices.retrieve(priceId);
+      const product = await stripe.products.retrieve(productId);
+      const productOfPrice = typeof price.product === "string" ? price.product : price.product.id;
+      if (!validCatalogPrice({ ...price, product: productOfPrice }, product)) return res.status(400).json({ error: "Invalid credit package" });
+      if (price.livemode && process.env.STRIPE_LIVE_CHARGING_ENABLED !== "true") return res.status(503).json({ error: "Live payments disabled" });
+      const credits = parseCreditAmount(product.metadata.credits)!;
+      const configuredOrigin = process.env.APP_BASE_URL;
+      if (!configuredOrigin) return res.status(503).json({ error: "Payment configuration unavailable" });
+      const origin = new URL(configuredOrigin);
+      if (origin.protocol !== "https:" && !(process.env.NODE_ENV !== "production" && origin.protocol === "http:" && ["localhost", "127.0.0.1"].includes(origin.hostname))) return res.status(503).json({ error: "Invalid payment configuration" });
+      const baseUrl = origin.origin;
 
       let customerId = user.stripeCustomerId;
       if (!customerId) {
         const customer = await stripe.customers.create({
           email: user.email,
           name: user.fullName,
-          metadata: { userId: user.id },
-        });
+          metadata: { userId: user.id, tenantId: String(user.tenantId) },
+        }, { idempotencyKey: `ravpaper-customer-${user.id}` });
         customerId = customer.id;
         await storage.updateUser(user.id, { stripeCustomerId: customerId } as any);
       }
 
-      const productResult = await db.execute(sql`
-        SELECT metadata FROM stripe.products WHERE id = ${productId}
-      `);
-      const productMeta = (productResult.rows[0] as any)?.metadata;
-      const credits = productMeta?.credits ? parseInt(productMeta.credits) : 1;
-
-      const baseUrl = `${req.protocol}://${req.get("host")}`;
       const session = await stripe.checkout.sessions.create({
         customer: customerId,
         payment_method_types: ["card"],
@@ -725,8 +731,10 @@ export async function registerRoutes(
         cancel_url: `${baseUrl}/pricing?canceled=true`,
         metadata: {
           userId: user.id,
+          tenantId: String(user.tenantId),
           credits: String(credits),
           productId,
+          priceId,
         },
       });
 
@@ -739,12 +747,14 @@ export async function registerRoutes(
   app.post("/api/stripe/verify-session", authMiddleware, async (req, res) => {
     try {
       const { sessionId } = req.body;
-      if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+      if (typeof sessionId !== "string" || !sessionId || sessionId.length > 256) return res.status(400).json({ error: "sessionId required" });
 
       const stripe = await getUncachableStripeClient();
       const session = await stripe.checkout.sessions.retrieve(sessionId);
 
-      if (session.payment_status !== "paid") {
+      const customer = typeof session.customer === "string" ? session.customer : session.customer?.id ?? null;
+      if (!ownsPayment(req.user!, { customer, metadata: session.metadata })) return res.status(403).json({ error: "Forbidden" });
+      if (session.mode !== "payment" || session.status !== "complete" || session.payment_status !== "paid" || !session.amount_total || session.currency !== "usd") {
         return res.json({ success: false, message: "Payment not completed" });
       }
 
@@ -755,7 +765,11 @@ export async function registerRoutes(
         return res.json({ success: true, credits: user?.reviewCredits ?? 0, alreadyProcessed: true });
       }
 
-      const credits = session.metadata?.credits ? parseInt(session.metadata.credits) : 1;
+      const credits = parseCreditAmount(session.metadata?.credits);
+      if (credits === null || !session.metadata?.priceId || !session.metadata?.productId) return res.status(409).json({ error: "Payment requires reconciliation" });
+      const lineItems = await stripe.checkout.sessions.listLineItems(sessionId, { limit: 2 });
+      const item = lineItems.data[0];
+      if (lineItems.has_more || lineItems.data.length !== 1 || item.quantity !== 1 || item.price?.id !== session.metadata.priceId || (typeof item.price.product === "string" ? item.price.product : item.price.product?.id) !== session.metadata.productId || item.amount_total !== session.amount_total) return res.status(409).json({ error: "Payment requires reconciliation" });
       const { user: updatedUser } = await storage.addCredits(
         req.user!.id,
         credits,
@@ -775,6 +789,7 @@ export async function registerRoutes(
 
       res.json({ success: true, credits: updatedUser.reviewCredits });
     } catch (e: any) {
+      if (e instanceof PaymentOwnershipError) return res.status(403).json({ error: "Forbidden" });
       res.status(500).json({ error: "Internal server error" });
     }
   });
