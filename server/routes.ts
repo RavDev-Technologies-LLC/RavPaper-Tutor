@@ -1,6 +1,6 @@
 import type { Express } from "express";
 import type { Server } from "http";
-import { storage, InsufficientCreditsError, PaymentOwnershipError } from "./storage";
+import { storage, InsufficientCreditsError, PaymentOwnershipError, AnalysisInProgressError } from "./storage";
 import { ownsPayment, parseCreditAmount, validCatalogPrice } from "./billing-policy";
 import {
   authMiddleware,
@@ -306,6 +306,9 @@ export async function registerRoutes(
 
   // ─── Analysis Routes ───────────────────────────────────────────
   app.post("/api/analysis/run/:documentId", authMiddleware, async (req, res) => {
+    let usageId: number | undefined;
+    let currentResultId: number | undefined;
+    let finalized = false;
     try {
       const documentId = Number(req.params.documentId);
       const doc = await storage.getDocument(documentId);
@@ -331,10 +334,8 @@ export async function registerRoutes(
         if (!selectedRubric || !canReadRubric(req.user!, selectedRubric)) return res.status(403).json({ error: "Rubric unavailable" });
       }
 
-      try { await storage.deductCredit(req.user!.id, documentId, `Analysis of "${doc.title}"`); }
-      catch (error) { if (error instanceof InsufficientCreditsError) return res.status(402).json({ error: "Insufficient review credits" }); throw error; }
-
-      await storage.updateDocument(documentId, { status: "processing" } as any);
+      try { const debit = await storage.deductCredit(req.user!.id, documentId, `Analysis of "${doc.title}"`); usageId = debit.transaction.id; }
+      catch (error) { if (error instanceof InsufficientCreditsError) return res.status(402).json({ error: "Insufficient review credits" }); if (error instanceof AnalysisInProgressError) return res.status(409).json({ error: "Document unavailable or already processing" }); throw error; }
 
       await storage.createAuditLog({
         tenantId: req.user!.tenantId,
@@ -366,6 +367,7 @@ export async function registerRoutes(
           details: null,
         });
 
+        currentResultId = record.id;
         let engineResult: any;
         try {
           switch (engine) {
@@ -388,15 +390,15 @@ export async function registerRoutes(
               engineResult = await runFormattingEngine(content);
               break;
             default:
-              engineResult = { score: 0, findings: [], summary: "Unknown engine" };
+              throw new Error("Unknown engine");
           }
-        } catch (err: any) {
-          engineResult = { score: 0, findings: [], summary: `Error: ${err.message}` };
+        } catch {
+          throw new Error("Analysis engine failed");
         }
 
         const updated = await storage.updateAnalysisResult(record.id, {
           status: "completed",
-          score: engineResult.score || 0,
+          score: engineResult.score,
           results: engineResult,
         });
 
@@ -418,7 +420,9 @@ export async function registerRoutes(
           await storage.createManyAnnotations(annotationBatch);
         }
 
+        if (!updated) throw new Error("Analysis result unavailable");
         results.push(updated);
+        currentResultId = undefined;
       }
 
       const aggregated = runScoringAggregator(
@@ -430,6 +434,7 @@ export async function registerRoutes(
         metadata: aggregated,
       } as any);
 
+      finalized = true;
       await storage.createAuditLog({
         tenantId: req.user!.tenantId,
         userId: req.user!.id,
@@ -442,6 +447,11 @@ export async function registerRoutes(
 
       res.json({ results, aggregated });
     } catch (e: any) {
+      if (usageId !== undefined && !finalized) {
+        try { await storage.refundFailedAnalysis(req.user!.id, usageId, currentResultId); }
+        catch { console.error(JSON.stringify({ event: "analysis_refund_failed", usageId })); return res.status(503).json({ error: "Analysis failed; credit reconciliation required" }); }
+        return res.status(502).json({ error: "Analysis failed; review credit restored" });
+      }
       res.status(500).json({ error: "Internal server error" });
     }
   });
@@ -499,7 +509,7 @@ export async function registerRoutes(
     try {
       const sessionId = Number(req.params.sessionId);
       const { questionIndex, answer } = req.body;
-      if (questionIndex === undefined || !answer) {
+      if (!Number.isSafeInteger(questionIndex) || typeof answer !== "string" || !answer.trim() || answer.length > 20000) {
         return res.status(400).json({ error: "questionIndex and answer are required" });
       }
 
@@ -769,7 +779,7 @@ export async function registerRoutes(
       if (credits === null || !session.metadata?.priceId || !session.metadata?.productId) return res.status(409).json({ error: "Payment requires reconciliation" });
       const lineItems = await stripe.checkout.sessions.listLineItems(sessionId, { limit: 2 });
       const item = lineItems.data[0];
-      if (lineItems.has_more || lineItems.data.length !== 1 || item.quantity !== 1 || item.price?.id !== session.metadata.priceId || (typeof item.price.product === "string" ? item.price.product : item.price.product?.id) !== session.metadata.productId || item.amount_total !== session.amount_total) return res.status(409).json({ error: "Payment requires reconciliation" });
+      if (lineItems.has_more || lineItems.data.length !== 1 || !item || !item.price || item.quantity !== 1 || item.price.id !== session.metadata.priceId || (typeof item.price.product === "string" ? item.price.product : item.price.product?.id) !== session.metadata.productId || item.amount_total !== session.amount_total) return res.status(409).json({ error: "Payment requires reconciliation" });
       const { user: updatedUser } = await storage.addCredits(
         req.user!.id,
         credits,

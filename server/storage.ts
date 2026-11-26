@@ -1,4 +1,4 @@
-import { eq, and, desc, sql, gt } from "drizzle-orm";
+import { eq, and, desc, sql, gt, ne } from "drizzle-orm";
 import { db } from "./db";
 import {
   tenants,
@@ -77,10 +77,12 @@ export interface IStorage {
   addCredits(userId: string, amount: number, description: string, stripeSessionId?: string): Promise<{ user: User; transaction: CreditTransaction }>;
   deductCredit(userId: string, documentId: number, description: string): Promise<{ user: User; transaction: CreditTransaction }>;
   getCreditTransactions(userId: string): Promise<CreditTransaction[]>;
+  refundFailedAnalysis(userId: string, usageId: number, resultId?: number): Promise<void>;
 }
 
 export class InsufficientCreditsError extends Error {}
 export class PaymentOwnershipError extends Error {}
+export class AnalysisInProgressError extends Error {}
 
 export class DatabaseStorage implements IStorage {
   async getUser(id: string): Promise<User | undefined> {
@@ -276,10 +278,29 @@ export class DatabaseStorage implements IStorage {
       const [user] = await tx.update(users).set({ reviewCredits: sql`${users.reviewCredits} - 1` })
         .where(and(eq(users.id, userId), eq(users.isActive, true), gt(users.reviewCredits, 0))).returning();
       if (!user) throw new InsufficientCreditsError("Insufficient review credits");
+      if (user.tenantId === null) throw new AnalysisInProgressError("Document unavailable");
+      const [claimed] = await tx.update(documents).set({ status: "processing", overallScore: null, metadata: null, updatedAt: new Date() }).where(and(eq(documents.id, documentId), eq(documents.userId, userId), eq(documents.tenantId, user.tenantId), ne(documents.status, "processing"))).returning({ id: documents.id });
+      if (!claimed) throw new AnalysisInProgressError("Document unavailable or already processing");
       const [transaction] = await tx.insert(creditTransactions).values({
         userId, tenantId: user.tenantId, type: "usage", amount: -1, balanceAfter: user.reviewCredits, description, documentId,
       }).returning();
       return { user, transaction };
+    });
+  }
+
+  async refundFailedAnalysis(userId: string, usageId: number, resultId?: number): Promise<void> {
+    await db.transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"analysis-refund:" + usageId}, 0))`);
+      const [usage] = await tx.select().from(creditTransactions).where(and(eq(creditTransactions.id, usageId), eq(creditTransactions.userId, userId), eq(creditTransactions.type, "usage")));
+      if (!usage || usage.amount !== -1 || usage.documentId === null) throw new Error("Invalid analysis credit reference");
+      const reference = "Refund for analysis usage #" + usageId;
+      const [existing] = await tx.select().from(creditTransactions).where(and(eq(creditTransactions.userId, userId), eq(creditTransactions.type, "refund"), eq(creditTransactions.description, reference))).limit(1);
+      if (existing) return;
+      const [user] = await tx.update(users).set({ reviewCredits: sql`${users.reviewCredits} + 1` }).where(eq(users.id, userId)).returning();
+      if (!user) throw new Error("User unavailable");
+      await tx.insert(creditTransactions).values({ userId, tenantId: usage.tenantId, type: "refund", amount: 1, balanceAfter: user.reviewCredits, description: reference, documentId: usage.documentId });
+      if (resultId !== undefined) await tx.update(analysisResults).set({ status: "failed", score: null, results: { summary: "Analysis operation failed." }, updatedAt: new Date() }).where(and(eq(analysisResults.id, resultId), eq(analysisResults.documentId, usage.documentId)));
+      await tx.update(documents).set({ status: "failed", overallScore: null, metadata: null, updatedAt: new Date() }).where(and(eq(documents.id, usage.documentId), eq(documents.userId, userId)));
     });
   }
 
