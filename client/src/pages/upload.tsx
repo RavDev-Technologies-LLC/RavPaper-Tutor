@@ -4,7 +4,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { useMutation } from "@tanstack/react-query";
-import { Upload as UploadIcon, FileText, X, FileUp, Type, Clipboard } from "lucide-react";
+import { Upload as UploadIcon, FileText, X, FileUp, Type } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
@@ -30,13 +30,14 @@ const submissionTypes = [
   { value: "ai_research_paper", label: "AI Research Paper" },
 ];
 
-const ACCEPTED_EXTENSIONS = [".txt", ".md", ".tex", ".rtf", ".csv", ".doc", ".docx", ".pdf"];
-const MAX_FILE_SIZE = 10 * 1024 * 1024;
+// Text is extracted on the server; these are the formats it can read.
+const ACCEPTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"];
+const MAX_FILE_SIZE = 20 * 1024 * 1024;
 
 const uploadSchema = z.object({
   title: z.string().min(1, "Title is required"),
   submissionType: z.string().min(1, "Submission type is required"),
-  fileContent: z.string().min(10, "Document content must be at least 10 characters"),
+  fileContent: z.string(),
 });
 
 type UploadForm = z.infer<typeof uploadSchema>;
@@ -57,7 +58,7 @@ export default function UploadPage() {
   const [, setLocation] = useLocation();
   const [inputMethod, setInputMethod] = useState<string>("file");
   const [isDragging, setIsDragging] = useState(false);
-  const [uploadedFile, setUploadedFile] = useState<{ name: string; size: number } | null>(null);
+  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const form = useForm<UploadForm>({
@@ -67,18 +68,17 @@ export default function UploadPage() {
 
   const uploadMutation = useMutation({
     mutationFn: async (data: UploadForm) => {
-      const fileName = uploadedFile?.name || `${data.title.replace(/\s+/g, "_").toLowerCase()}.txt`;
-      const res = await authFetch("/api/documents", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title: data.title,
-          submissionType: data.submissionType,
-          fileName,
-          fileSize: new Blob([data.fileContent]).size,
-          fileContent: data.fileContent,
-        }),
-      });
+      const body = new FormData();
+      body.append("title", data.title);
+      body.append("submissionType", data.submissionType);
+      if (inputMethod === "file" && uploadedFile) {
+        body.append("file", uploadedFile, uploadedFile.name);
+      } else {
+        const name = `${data.title.replace(/[^a-z0-9]+/gi, "_").toLowerCase() || "pasted_text"}.txt`;
+        body.append("file", new Blob([data.fileContent], { type: "text/plain;charset=utf-8" }), name);
+      }
+      // The browser sets the multipart boundary; do not set Content-Type manually.
+      const res = await authFetch("/api/documents/upload", { method: "POST", body });
       if (!res.ok) {
         const error = await res.json().catch(() => ({ error: res.statusText }));
         throw new Error(error.error || "Upload failed");
@@ -87,7 +87,8 @@ export default function UploadPage() {
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["/api/documents"] });
-      toast({ title: "Document Uploaded", description: "Your document has been uploaded successfully." });
+      const words = data?.metadata?.extraction?.words;
+      toast({ title: "Document Uploaded", description: words ? `Extracted ${Number(words).toLocaleString()} words.` : "Your document has been uploaded successfully." });
       setLocation(`/documents/${data.id}`);
     },
     onError: (error: any) => {
@@ -95,21 +96,12 @@ export default function UploadPage() {
     },
   });
 
-  const readFileAsText = useCallback((file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () => reject(new Error("Failed to read file"));
-      reader.readAsText(file);
-    });
-  }, []);
-
   const processFile = useCallback(async (file: File) => {
     const ext = getFileExtension(file.name);
     if (!ACCEPTED_EXTENSIONS.includes(ext)) {
       toast({
         title: "Unsupported File Type",
-        description: `Please upload a text-based file (${ACCEPTED_EXTENSIONS.join(", ")}).`,
+        description: `Supported formats: ${ACCEPTED_EXTENSIONS.join(", ")}.`,
         variant: "destructive",
       });
       return;
@@ -123,21 +115,13 @@ export default function UploadPage() {
       return;
     }
 
-    try {
-      const content = await readFileAsText(file);
-      form.setValue("fileContent", content, { shouldValidate: true });
-      setUploadedFile({ name: file.name, size: file.size });
-
-      if (!form.getValues("title")) {
-        const nameWithoutExt = file.name.replace(/\.[^/.]+$/, "").replace(/[_-]/g, " ");
-        form.setValue("title", nameWithoutExt, { shouldValidate: true });
-      }
-
-      toast({ title: "File Loaded", description: `"${file.name}" has been loaded successfully.` });
-    } catch {
-      toast({ title: "Read Error", description: "Could not read the file contents.", variant: "destructive" });
+    setUploadedFile(file);
+    form.setValue("fileContent", "", { shouldValidate: false });
+    if (!form.getValues("title")) {
+      const nameWithoutExt = file.name.replace(/\.[^/.]+$/, "").replace(/[_-]/g, " ");
+      form.setValue("title", nameWithoutExt, { shouldValidate: true });
     }
-  }, [form, toast, readFileAsText]);
+  }, [form, toast]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -174,6 +158,14 @@ export default function UploadPage() {
   }, [form]);
 
   const onSubmit = (data: UploadForm) => {
+    if (inputMethod === "file" && !uploadedFile) {
+      form.setError("fileContent", { message: "Select a file to upload" });
+      return;
+    }
+    if (inputMethod === "paste" && data.fileContent.trim().length < 50) {
+      form.setError("fileContent", { message: "Pasted text must be at least 50 characters" });
+      return;
+    }
     uploadMutation.mutate(data);
   };
 
@@ -287,7 +279,7 @@ export default function UploadPage() {
                                 <p className="font-medium truncate" data-testid="text-file-name">{uploadedFile.name}</p>
                                 <p className="text-sm text-muted-foreground">{formatFileSize(uploadedFile.size)}</p>
                               </div>
-                              <Badge variant="secondary" className="shrink-0">{charCount.toLocaleString()} chars</Badge>
+                              <Badge variant="secondary" className="shrink-0">{getFileExtension(uploadedFile.name).slice(1).toUpperCase()}</Badge>
                               <Button
                                 type="button"
                                 variant="ghost"

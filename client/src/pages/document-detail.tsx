@@ -12,6 +12,7 @@ import { Separator } from "@/components/ui/separator";
 import { useToast } from "@/hooks/use-toast";
 import { authQueryFn, authFetch } from "@/lib/auth";
 import { queryClient } from "@/lib/queryClient";
+import { engineLabel } from "@shared/engine-labels";
 import type { Document, Annotation, AnalysisResult } from "@shared/schema";
 
 function getStatusColor(status: string): string {
@@ -42,9 +43,7 @@ function formatSubmissionType(type: string): string {
   return type.split("_").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
 }
 
-function formatEngineType(type: string): string {
-  return type.split("_").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
-}
+const formatEngineType = engineLabel;
 
 function formatDate(dateStr: string): string {
   return new Date(dateStr).toLocaleDateString("en-US", {

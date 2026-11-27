@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { useParams, Link } from "wouter";
 import { FlaskConical, ArrowLeft, CheckCircle2, AlertTriangle, Coins } from "lucide-react";
@@ -16,15 +16,12 @@ import { useToast } from "@/hooks/use-toast";
 import { authQueryFn, authFetch } from "@/lib/auth";
 import { queryClient } from "@/lib/queryClient";
 import type { Document, Rubric } from "@shared/schema";
+import { ENGINE_LABELS, engineLabel } from "@shared/engine-labels";
 
-const ALL_ENGINES = [
-  { id: "plagiarism", name: "Plagiarism Detection" },
-  { id: "rubric_alignment", name: "Rubric Alignment" },
-  { id: "statistics", name: "Statistics Review" },
-  { id: "literature_review", name: "Literature Review" },
-  { id: "anthropomorphism", name: "Anthropomorphism Check" },
-  { id: "formatting", name: "Formatting Review" },
-];
+const ALL_ENGINES = Object.entries(ENGINE_LABELS).map(([id, name]) => ({ id, name }));
+
+type JobView = { id: number; status: "queued" | "running" | "succeeded" | "failed" | "cancelled"; engines: string[]; completedEngines?: string[]; attempts: number; cancelRequested: boolean; error: string | null };
+const isActive = (j?: JobView | null) => !!j && (j.status === "queued" || j.status === "running");
 
 function getScoreColor(score: number): string {
   if (score >= 80) return "text-green-600 dark:text-green-400";
@@ -38,9 +35,7 @@ function getScoreBg(score: number): string {
   return "bg-red-100 dark:bg-red-900/30";
 }
 
-function formatEngineType(type: string): string {
-  return type.split("_").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
-}
+const formatEngineType = engineLabel;
 
 export default function AnalysisPage() {
   const params = useParams<{ documentId: string }>();
@@ -69,11 +64,53 @@ export default function AnalysisPage() {
 
   const hasCredits = (creditBalance?.credits ?? 0) >= 1;
 
+  const [jobId, setJobId] = useState<number | null>(null);
+
+  // Resume tracking if an analysis for this document is already queued or running.
+  const { data: latestJob } = useQuery<JobView | null>({
+    queryKey: ["/api/documents", documentId, "jobs", "latest"],
+    queryFn: authQueryFn,
+    enabled: !!documentId && jobId === null,
+  });
+  useEffect(() => { if (jobId === null && isActive(latestJob)) setJobId(latestJob!.id); }, [latestJob, jobId]);
+
+  const { data: job } = useQuery<JobView>({
+    queryKey: ["/api/analysis/jobs", String(jobId)],
+    queryFn: authQueryFn,
+    enabled: jobId !== null,
+    refetchInterval: (q) => (isActive(q.state.data as JobView | undefined) || !q.state.data ? 2000 : false),
+  });
+
+  const refreshAll = () => {
+    for (const key of [["/api/documents", documentId], ["/api/analysis/results", documentId], ["/api/documents"], ["/api/credits/balance"], ["/api/credits/transactions"]]) {
+      queryClient.invalidateQueries({ queryKey: key });
+    }
+  };
+
+  useEffect(() => {
+    if (!job || isActive(job)) return;
+    refreshAll();
+    if (job.status === "succeeded") {
+      (async () => {
+        const [resultsRes, docRes] = await Promise.all([authFetch(`/api/analysis/results/${documentId}`), authFetch(`/api/documents/${documentId}`)]);
+        const all = resultsRes.ok ? await resultsRes.json() : [];
+        const doc = docRes.ok ? await docRes.json() : null;
+        setResults({ results: all, aggregated: doc?.metadata });
+        toast({ title: "Analysis Complete", description: "All engines have completed their analysis." });
+      })();
+    } else if (job.status === "failed") {
+      toast({ title: "Analysis Failed", description: job.error ?? "Analysis failed; your review credit was restored.", variant: "destructive" });
+    } else if (job.status === "cancelled") {
+      toast({ title: "Analysis Cancelled", description: "Your review credit was restored." });
+    }
+    setJobId(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job?.status]);
+
   const analysisMutation = useMutation({
     mutationFn: async () => {
       const body: any = { engines: selectedEngines };
       if (selectedRubricId) body.rubricId = Number(selectedRubricId);
-
       const res = await authFetch(`/api/analysis/run/${documentId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -83,24 +120,30 @@ export default function AnalysisPage() {
         const err = await res.json().catch(() => ({ error: res.statusText }));
         throw new Error(err.error || "Analysis failed");
       }
-      return res.json();
+      return res.json() as Promise<{ jobId: number }>;
     },
     onSuccess: (data) => {
-      setResults(data);
-      queryClient.invalidateQueries({ queryKey: ["/api/documents", documentId] });
-      queryClient.invalidateQueries({ queryKey: ["/api/analysis/results", documentId] });
-      queryClient.invalidateQueries({ queryKey: ["/api/documents"] });
+      setResults(null);
+      setJobId(data.jobId);
       queryClient.invalidateQueries({ queryKey: ["/api/credits/balance"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/credits/transactions"] });
-      toast({ title: "Analysis Complete", description: "All engines have completed their analysis." });
     },
     onError: (error: any) => {
-      queryClient.invalidateQueries({ queryKey: ["/api/documents", documentId] });
-      queryClient.invalidateQueries({ queryKey: ["/api/analysis/results", documentId] });
-      queryClient.invalidateQueries({ queryKey: ["/api/credits/balance"] });
+      refreshAll();
       toast({ title: "Analysis Failed", description: error.message, variant: "destructive" });
     },
   });
+
+  const cancelMutation = useMutation({
+    mutationFn: async () => {
+      const res = await authFetch(`/api/analysis/jobs/${jobId}/cancel`, { method: "POST" });
+      if (!res.ok && res.status !== 409) throw new Error("Could not cancel");
+      queryClient.invalidateQueries({ queryKey: ["/api/analysis/jobs", String(jobId)] });
+    },
+  });
+
+  const running = jobId !== null || analysisMutation.isPending;
+  const done = job?.completedEngines?.length ?? 0;
+  const total = job?.engines.length ?? selectedEngines.length;
 
   const toggleEngine = (engineId: string) => {
     setSelectedEngines((prev) =>
@@ -131,7 +174,7 @@ export default function AnalysisPage() {
         </div>
       </div>
 
-      {!results && (
+      {!results && !running && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2">
             <Card>
@@ -199,7 +242,7 @@ export default function AnalysisPage() {
                 <Button
                   className="w-full"
                   onClick={() => analysisMutation.mutate()}
-                  disabled={analysisMutation.isPending || selectedEngines.length === 0 || !hasCredits}
+                  disabled={running || selectedEngines.length === 0 || !hasCredits}
                   data-testid="button-run-analysis"
                 >
                   {analysisMutation.isPending ? (
@@ -217,13 +260,22 @@ export default function AnalysisPage() {
         </div>
       )}
 
-      {analysisMutation.isPending && (
-        <Card>
+      {running && (
+        <Card data-testid="card-analysis-progress">
           <CardContent className="py-12 text-center">
             <FlaskConical className="h-12 w-12 mx-auto text-primary mb-4 animate-pulse" />
-            <h3 className="text-lg font-medium mb-2">Analysis in Progress</h3>
-            <p className="text-muted-foreground mb-4">Running {selectedEngines.length} analysis engines...</p>
-            <Progress value={undefined} className="h-2 max-w-md mx-auto" />
+            <h3 className="text-lg font-medium mb-2">{job?.status === "queued" || !job ? "Analysis Queued" : "Analysis in Progress"}</h3>
+            <p className="text-muted-foreground mb-4" data-testid="text-analysis-progress">
+              {job?.cancelRequested ? "Cancelling..." : `${done} of ${total} engines complete`}
+              {job && job.attempts > 1 ? ` (attempt ${job.attempts})` : ""}
+            </p>
+            <Progress value={total ? (done / total) * 100 : undefined} className="h-2 max-w-md mx-auto mb-4" />
+            <p className="text-xs text-muted-foreground mb-4">You can leave this page; the analysis keeps running.</p>
+            {job && !job.cancelRequested && (
+              <Button variant="outline" size="sm" onClick={() => cancelMutation.mutate()} disabled={cancelMutation.isPending} data-testid="button-cancel-analysis">
+                Cancel analysis
+              </Button>
+            )}
           </CardContent>
         </Card>
       )}

@@ -1,4 +1,5 @@
-import { eq, and, desc, sql, gt, ne } from "drizzle-orm";
+import { eq, and, desc, sql, gt, ne, inArray } from "drizzle-orm";
+import { randomBytes } from "node:crypto";
 import { db } from "./db";
 import {
   tenants,
@@ -10,6 +11,7 @@ import {
   auditLogs,
   defenseSessions,
   creditTransactions,
+  analysisJobs,
   type Tenant,
   type InsertTenant,
   type User,
@@ -35,6 +37,7 @@ export interface IStorage {
   getUserByUsername(username: string): Promise<User | undefined>;
   getUserByEmail(email: string): Promise<User | undefined>;
   createUser(user: InsertUser): Promise<User>;
+  registerUser(input: { username: string; email: string; passwordHash: string; fullName: string }): Promise<User>;
   updateUser(id: string, data: Partial<InsertUser>): Promise<User | undefined>;
   getUsersByTenant(tenantId: number): Promise<User[]>;
 
@@ -48,7 +51,7 @@ export interface IStorage {
   updateDocument(id: number, data: Partial<InsertDocument>): Promise<Document | undefined>;
   getDocumentsByUser(userId: string): Promise<Document[]>;
   getDocumentsByTenant(tenantId: number): Promise<Document[]>;
-  deleteDocument(id: number): Promise<void>;
+  deleteDocument(id: number, actor: { userId: string; tenantId: number; ipAddress: string | null }): Promise<"deleted" | "not_found" | "busy">;
 
   getRubric(id: number): Promise<Rubric | undefined>;
   createRubric(rubric: InsertRubric): Promise<Rubric>;
@@ -96,8 +99,22 @@ export class DatabaseStorage implements IStorage {
   }
 
   async getUserByEmail(email: string): Promise<User | undefined> {
-    const [user] = await db.select().from(users).where(eq(users.email, email));
+    const [user] = await db.select().from(users).where(sql`lower(${users.email}) = ${email.trim().toLowerCase()}`);
     return user;
+  }
+
+  /** Create the user's organisation and account atomically (no orphan tenants). */
+  async registerUser(input: { username: string; email: string; passwordHash: string; fullName: string }): Promise<User> {
+    return db.transaction(async (tx) => {
+      const slugBase = input.username.toLowerCase().replace(/[^a-z0-9]/g, "-").slice(0, 40) || "org";
+      const slug = `${slugBase}-${randomBytes(4).toString("hex")}`;
+      const [tenant] = await tx.insert(tenants).values({ name: `${input.fullName}'s Organization`, slug, plan: "free", isActive: true }).returning();
+      const [user] = await tx.insert(users).values({
+        tenantId: tenant.id, username: input.username, email: input.email, password: input.passwordHash,
+        fullName: input.fullName, role: "student", isActive: true,
+      }).returning();
+      return user;
+    });
   }
 
   async createUser(user: InsertUser): Promise<User> {
@@ -156,8 +173,31 @@ export class DatabaseStorage implements IStorage {
     return db.select().from(documents).where(eq(documents.tenantId, tenantId)).orderBy(desc(documents.createdAt));
   }
 
-  async deleteDocument(id: number): Promise<void> {
-    await db.delete(documents).where(eq(documents.id, id));
+  /**
+   * Transactional document deletion (see docs/DATA_LIFECYCLE.md):
+   * locks the row, refuses while an analysis job is active, removes derived records via
+   * ON DELETE CASCADE (results, annotations, defense sessions, finished jobs), keeps the
+   * credit ledger (document_id becomes NULL) and writes the audit entry atomically.
+   */
+  async deleteDocument(id: number, actor: { userId: string; tenantId: number; ipAddress: string | null }): Promise<"deleted" | "not_found" | "busy"> {
+    return db.transaction(async tx => {
+      const [doc] = await tx.select().from(documents).where(and(eq(documents.id, id), eq(documents.tenantId, actor.tenantId))).for("update");
+      if (!doc) return "not_found";
+      const [active] = await tx.select({ id: analysisJobs.id }).from(analysisJobs)
+        .where(and(eq(analysisJobs.documentId, id), inArray(analysisJobs.status, ["queued", "running"]))).limit(1);
+      if (active || doc.status === "processing") return "busy";
+      const [counts] = (await tx.execute(sql`select
+        (select count(*) from analysis_results where document_id = ${id})::int as results,
+        (select count(*) from annotations where document_id = ${id})::int as annotations,
+        (select count(*) from defense_sessions where document_id = ${id})::int as defense_sessions,
+        (select count(*) from credit_transactions where document_id = ${id})::int as ledger_entries_retained`)).rows as any[];
+      await tx.delete(documents).where(eq(documents.id, id));
+      await tx.insert(auditLogs).values({
+        tenantId: actor.tenantId, userId: actor.userId, action: "document_deleted", resourceType: "document",
+        resourceId: String(id), details: { title: doc.title, ...counts }, ipAddress: actor.ipAddress,
+      });
+      return "deleted";
+    });
   }
 
   async getRubric(id: number): Promise<Rubric | undefined> {
@@ -290,17 +330,9 @@ export class DatabaseStorage implements IStorage {
 
   async refundFailedAnalysis(userId: string, usageId: number, resultId?: number): Promise<void> {
     await db.transaction(async tx => {
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"analysis-refund:" + usageId}, 0))`);
-      const [usage] = await tx.select().from(creditTransactions).where(and(eq(creditTransactions.id, usageId), eq(creditTransactions.userId, userId), eq(creditTransactions.type, "usage")));
-      if (!usage || usage.amount !== -1 || usage.documentId === null) throw new Error("Invalid analysis credit reference");
-      const reference = "Refund for analysis usage #" + usageId;
-      const [existing] = await tx.select().from(creditTransactions).where(and(eq(creditTransactions.userId, userId), eq(creditTransactions.type, "refund"), eq(creditTransactions.description, reference))).limit(1);
-      if (existing) return;
-      const [user] = await tx.update(users).set({ reviewCredits: sql`${users.reviewCredits} + 1` }).where(eq(users.id, userId)).returning();
-      if (!user) throw new Error("User unavailable");
-      await tx.insert(creditTransactions).values({ userId, tenantId: usage.tenantId, type: "refund", amount: 1, balanceAfter: user.reviewCredits, description: reference, documentId: usage.documentId });
-      if (resultId !== undefined) await tx.update(analysisResults).set({ status: "failed", score: null, results: { summary: "Analysis operation failed." }, updatedAt: new Date() }).where(and(eq(analysisResults.id, resultId), eq(analysisResults.documentId, usage.documentId)));
-      await tx.update(documents).set({ status: "failed", overallScore: null, metadata: null, updatedAt: new Date() }).where(and(eq(documents.id, usage.documentId), eq(documents.userId, userId)));
+      const usage = await refundUsageInTx(tx, userId, usageId);
+      if (resultId !== undefined) await tx.update(analysisResults).set({ status: "failed", score: null, results: { summary: "Analysis operation failed." }, updatedAt: new Date() }).where(and(eq(analysisResults.id, resultId), eq(analysisResults.documentId, usage.documentId!)));
+      await tx.update(documents).set({ status: "failed", overallScore: null, metadata: null, updatedAt: new Date() }).where(and(eq(documents.id, usage.documentId!), eq(documents.userId, userId)));
     });
   }
 
@@ -314,3 +346,19 @@ export class DatabaseStorage implements IStorage {
 }
 
 export const storage = new DatabaseStorage();
+
+type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/** Idempotently refund one analysis usage debit inside an existing transaction. */
+export async function refundUsageInTx(tx: Tx, userId: string, usageId: number): Promise<CreditTransaction> {
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${"analysis-refund:" + usageId}, 0))`);
+  const [usage] = await tx.select().from(creditTransactions).where(and(eq(creditTransactions.id, usageId), eq(creditTransactions.userId, userId), eq(creditTransactions.type, "usage")));
+  if (!usage || usage.amount !== -1 || usage.documentId === null) throw new Error("Invalid analysis credit reference");
+  const reference = "Refund for analysis usage #" + usageId;
+  const [existing] = await tx.select().from(creditTransactions).where(and(eq(creditTransactions.userId, userId), eq(creditTransactions.type, "refund"), eq(creditTransactions.description, reference))).limit(1);
+  if (existing) return usage;
+  const [user] = await tx.update(users).set({ reviewCredits: sql`${users.reviewCredits} + 1` }).where(eq(users.id, userId)).returning();
+  if (!user) throw new Error("User unavailable");
+  await tx.insert(creditTransactions).values({ userId, tenantId: usage.tenantId, type: "refund", amount: 1, balanceAfter: user.reviewCredits, description: reference, documentId: usage.documentId });
+  return usage;
+}

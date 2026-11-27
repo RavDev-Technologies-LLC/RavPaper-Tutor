@@ -1,0 +1,13 @@
+# Code owners. The team needs write access to this repository for reviews to count.
+# Security-sensitive paths are listed explicitly so they can be reassigned to a dedicated security team later.
+*                       @RavDev-Technologies-LLC/review-and-approval-team
+/server/auth*.ts        @RavDev-Technologies-LLC/review-and-approval-team
+/server/sessions.ts     @RavDev-Technologies-LLC/review-and-approval-team
+/server/rate-limit.ts   @RavDev-Technologies-LLC/review-and-approval-team
+/server/billing-policy.ts @RavDev-Technologies-LLC/review-and-approval-team
+/server/fulfillment.ts  @RavDev-Technologies-LLC/review-and-approval-team
+/server/webhookHandlers.ts @RavDev-Technologies-LLC/review-and-approval-team
+/server/stripeClient.ts @RavDev-Technologies-LLC/review-and-approval-team
+/shared/schema.ts       @RavDev-Technologies-LLC/review-and-approval-team
+/migrations/            @RavDev-Technologies-LLC/review-and-approval-team
+/.github/               @RavDev-Technologies-LLC/review-and-approval-team
