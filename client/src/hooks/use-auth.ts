@@ -1,6 +1,6 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient } from "@/lib/queryClient";
-import { setTokens, clearTokens, authQueryFn, authFetch } from "@/lib/auth";
+import { setAccessToken, logoutRequest, authQueryFn } from "@/lib/auth";
 import type { User } from "@shared/schema";
 
 export function useAuth() {
@@ -16,6 +16,7 @@ export function useAuth() {
       const res = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
         body: JSON.stringify({ email, password }),
       });
       if (!res.ok) {
@@ -25,7 +26,7 @@ export function useAuth() {
       return res.json();
     },
     onSuccess: (data) => {
-      setTokens(data.accessToken, data.refreshToken);
+      setAccessToken(data.accessToken);
       queryClient.setQueryData(["/api/auth/me"], data.user);
       queryClient.invalidateQueries({ queryKey: ["/api/auth/me"] });
     },
@@ -36,6 +37,7 @@ export function useAuth() {
       const res = await fetch("/api/auth/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
         body: JSON.stringify(params),
       });
       if (!res.ok) {
@@ -45,14 +47,14 @@ export function useAuth() {
       return res.json();
     },
     onSuccess: (data) => {
-      setTokens(data.accessToken, data.refreshToken);
+      setAccessToken(data.accessToken);
       queryClient.setQueryData(["/api/auth/me"], data.user);
       queryClient.invalidateQueries({ queryKey: ["/api/auth/me"] });
     },
   });
 
-  const logout = () => {
-    clearTokens();
+  const logout = async () => {
+    await logoutRequest().catch(() => {});
     queryClient.setQueryData(["/api/auth/me"], null);
     queryClient.clear();
   };

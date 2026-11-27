@@ -1,54 +1,53 @@
 import type { QueryFunctionContext } from "@tanstack/react-query";
 
-const ACCESS_TOKEN_KEY = "pt_access_token";
-const REFRESH_TOKEN_KEY = "pt_refresh_token";
+// The access token lives only in memory. The refresh token is an httpOnly, SameSite=Strict
+// cookie scoped to /api/auth, so page scripts can never read it.
+let accessToken: string | null = null;
+
+// Tokens persisted by earlier releases are removed on load.
+try {
+  localStorage.removeItem("pt_access_token");
+  localStorage.removeItem("pt_refresh_token");
+} catch { /* storage unavailable */ }
+
+const CSRF_HEADER = { "x-ravpaper-client": "web" };
 
 export function getAccessToken(): string | null {
-  return localStorage.getItem(ACCESS_TOKEN_KEY);
+  return accessToken;
 }
 
-export function getRefreshToken(): string | null {
-  return localStorage.getItem(REFRESH_TOKEN_KEY);
-}
-
-export function setTokens(access: string, refresh: string): void {
-  localStorage.setItem(ACCESS_TOKEN_KEY, access);
-  localStorage.setItem(REFRESH_TOKEN_KEY, refresh);
+export function setAccessToken(token: string | null): void {
+  accessToken = token;
 }
 
 export function clearTokens(): void {
-  localStorage.removeItem(ACCESS_TOKEN_KEY);
-  localStorage.removeItem(REFRESH_TOKEN_KEY);
+  accessToken = null;
 }
 
-let isRefreshing = false;
 let refreshPromise: Promise<boolean> | null = null;
 
-async function tryRefreshToken(): Promise<boolean> {
-  if (isRefreshing && refreshPromise) {
-    return refreshPromise;
-  }
-  isRefreshing = true;
+async function refreshOnce(): Promise<Response> {
+  return fetch("/api/auth/refresh", { method: "POST", credentials: "same-origin", headers: CSRF_HEADER });
+}
+
+/** Exchange the refresh cookie for a new access token. Concurrent callers share one request. */
+export function tryRefreshToken(): Promise<boolean> {
+  if (refreshPromise) return refreshPromise;
   refreshPromise = (async () => {
     try {
-      const refreshToken = getRefreshToken();
-      if (!refreshToken) return false;
-
-      const res = await fetch("/api/auth/refresh", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refreshToken }),
-      });
-
-      if (!res.ok) return false;
-
+      let res = await refreshOnce();
+      // 409: another tab rotated the token a moment ago; its new cookie is now in place.
+      if (res.status === 409) {
+        await new Promise((r) => setTimeout(r, 500));
+        res = await refreshOnce();
+      }
+      if (!res.ok) { accessToken = null; return false; }
       const data = await res.json();
-      setTokens(data.accessToken, data.refreshToken);
+      accessToken = data.accessToken;
       return true;
     } catch {
       return false;
     } finally {
-      isRefreshing = false;
       refreshPromise = null;
     }
   })();
@@ -56,39 +55,33 @@ async function tryRefreshToken(): Promise<boolean> {
 }
 
 export async function authFetch(url: string, options?: RequestInit): Promise<Response> {
-  const token = getAccessToken();
+  if (!accessToken) await tryRefreshToken();
   const headers = new Headers(options?.headers);
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
+  if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+  let res = await fetch(url, { ...options, headers, credentials: "same-origin" });
+  if (res.status === 401 && (await tryRefreshToken())) {
+    headers.set("Authorization", `Bearer ${accessToken}`);
+    res = await fetch(url, { ...options, headers, credentials: "same-origin" });
   }
-
-  let res = await fetch(url, { ...options, headers });
-
-  if (res.status === 401 && token) {
-    const refreshed = await tryRefreshToken();
-    if (refreshed) {
-      const newToken = getAccessToken();
-      headers.set("Authorization", `Bearer ${newToken}`);
-      res = await fetch(url, { ...options, headers });
-    }
-  }
-
   return res;
+}
+
+export async function logoutRequest(): Promise<void> {
+  try {
+    await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin", headers: CSRF_HEADER });
+  } finally {
+    accessToken = null;
+  }
 }
 
 export async function authQueryFn<T>({ queryKey }: QueryFunctionContext): Promise<T> {
   const url = queryKey[0] as string;
   const fullUrl = queryKey.length > 1 ? `${url}/${queryKey.slice(1).join("/")}` : url;
   const res = await authFetch(fullUrl);
-
-  if (res.status === 401) {
-    return null as T;
-  }
-
+  if (res.status === 401) return null as T;
   if (!res.ok) {
     const text = (await res.text()) || res.statusText;
     throw new Error(`${res.status}: ${text}`);
   }
-
   return (await res.json()) as T;
 }

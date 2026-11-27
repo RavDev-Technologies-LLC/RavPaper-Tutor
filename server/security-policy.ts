@@ -16,8 +16,10 @@ export function canChangeRole(actor: Principal, target: Principal, nextRole: str
   if (actor.role === "super_admin") return academicRoles.has(nextRole) || nextRole === "program_admin" || nextRole === "security_admin";
   return academicRoles.has(target.role) && academicRoles.has(nextRole);
 }
-export function tokenHasPurpose(payload: unknown, purpose: "access" | "refresh"): payload is { userId: string; type: string } {
+/** Access tokens must declare their purpose and be bound to a server-side session (sid). */
+export function tokenHasPurpose(payload: unknown, purpose: "access"): payload is { userId: string; type: "access"; sid: string } {
   if (!payload || typeof payload !== "object") return false;
   const claims = payload as Record<string, unknown>;
-  return claims.type === purpose && typeof claims.userId === "string" && claims.userId.length > 0;
+  return claims.type === purpose && typeof claims.userId === "string" && claims.userId.length > 0 &&
+    typeof claims.sid === "string" && claims.sid.length > 0;
 }

@@ -14,7 +14,7 @@ const registerSchema = z.object({
   fullName: z.string().min(2, "Full name must be at least 2 characters"),
   email: z.string().email("Please enter a valid email address"),
   username: z.string().min(3, "Username must be at least 3 characters").regex(/^[a-zA-Z0-9_]+$/, "Username can only contain letters, numbers, and underscores"),
-  password: z.string().min(6, "Password must be at least 6 characters"),
+  password: z.string().min(12, "Password must be at least 12 characters").refine((v) => new TextEncoder().encode(v).length <= 72, "Password is too long"),
   confirmPassword: z.string(),
 }).refine((data) => data.password === data.confirmPassword, {
   message: "Passwords do not match",
@@ -149,7 +149,7 @@ export default function RegisterPage() {
                     <FormItem>
                       <FormLabel>Password</FormLabel>
                       <FormControl>
-                        <Input type="password" placeholder="At least 6 characters" data-testid="input-password" {...field} />
+                        <Input type="password" placeholder="At least 12 characters" data-testid="input-password" {...field} />
                       </FormControl>
                       <FormMessage />
                     </FormItem>
