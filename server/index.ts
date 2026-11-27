@@ -1,131 +1,50 @@
-import express, { type Request, Response, NextFunction } from "express";
-import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
-import { createServer } from "http";
-import { randomUUID } from "node:crypto";
-import { runMigrations } from 'stripe-replit-sync';
-import { getStripeSync } from './stripeClient';
-import { WebhookHandlers } from './webhookHandlers';
-
-const app = express();
-const httpServer = createServer(app);
-
-declare module "http" {
-  interface IncomingMessage {
-    rawBody: unknown;
-  }
-}
-
-async function initStripe() {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) {
-    console.warn('DATABASE_URL not set, skipping Stripe initialization');
-    return;
-  }
-
-  try {
-    console.log('Initializing Stripe schema...');
-    await runMigrations({ databaseUrl } as any);
-    console.log('Stripe schema ready');
-
-    const stripeSync = await getStripeSync();
-
-    console.log('Setting up managed webhook...');
-    const webhookBaseUrl = `https://${process.env.REPLIT_DOMAINS?.split(',')[0]}`;
-    try {
-      const result = await stripeSync.findOrCreateManagedWebhook(
-        `${webhookBaseUrl}/api/stripe/webhook`
-      );
-      console.log(`Webhook configured: ${result?.webhook?.url || 'OK'}`);
-    } catch (webhookErr: any) {
-      console.warn('Webhook setup skipped (may need deployment):', webhookErr.message);
-    }
-
-    console.log('Syncing Stripe data...');
-    stripeSync.syncBackfill()
-      .then(() => console.log('Stripe data synced'))
-      .catch((err: any) => console.error('Error syncing Stripe data:', err));
-  } catch (error) {
-    console.error('Failed to initialize Stripe:', error);
-  }
-}
-
-// Explicit development provisioning only; production startup must not modify Stripe or database schema.
-if (process.env.NODE_ENV !== 'production' && process.env.REPLIT_DEPLOYMENT !== '1' && process.env.STRIPE_DEV_PROVISION === 'true') await initStripe();
-
-app.post(
-  '/api/stripe/webhook',
-  express.raw({ type: 'application/json' }),
-  async (req, res) => {
-    const signature = req.headers['stripe-signature'];
-    if (!signature) {
-      return res.status(400).json({ error: 'Missing stripe-signature' });
-    }
-
-    try {
-      const sig = Array.isArray(signature) ? signature[0] : signature;
-      if (!Buffer.isBuffer(req.body)) {
-        console.error('STRIPE WEBHOOK ERROR: req.body is not a Buffer');
-        return res.status(500).json({ error: 'Webhook processing error' });
-      }
-      await WebhookHandlers.processWebhook(req.body as Buffer, sig);
-      res.status(200).json({ received: true });
-    } catch (error: any) {
-      console.error(JSON.stringify({ event: 'webhook_error' }));
-      res.status(400).json({ error: 'Webhook processing error' });
-    }
-  }
-);
-
-app.use(
-  express.json({
-    limit: "50mb",
-    verify: (req, _res, buf) => {
-      req.rawBody = buf;
-    },
-  }),
-);
-
-app.use(express.urlencoded({ extended: false }));
+import { runMigrations as runStripeMigrations } from "stripe-replit-sync";
+import { getStripeSync } from "./stripeClient";
+import { createApp } from "./app";
+import { assertStartupConfig, isProduction } from "./config";
+import { migrationStatus } from "./migrations";
+import { startWorker } from "./jobs";
+import { pool } from "./db";
 
 export function log(message: string, source = "express") {
-  const formattedTime = new Date().toLocaleTimeString("en-US", {
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: true,
-  });
-
+  const formattedTime = new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true });
   console.log(`${formattedTime} [${source}] ${message}`);
 }
 
-app.use((req, res, next) => {
-  const start = Date.now();
-  const requestId = randomUUID();
-  res.setHeader("X-Request-ID", requestId);
-  res.on("finish", () => {
-    if (req.path.startsWith("/api")) {
-      console.log(JSON.stringify({ event: "api_request", requestId, method: req.method, status: res.statusCode, durationMs: Date.now() - start }));
+async function initStripe() {
+  const databaseUrl = process.env.DATABASE_URL!;
+  try {
+    console.log("Initializing Stripe schema...");
+    await runStripeMigrations({ databaseUrl } as any);
+    const stripeSync = await getStripeSync();
+    const webhookBaseUrl = `https://${process.env.REPLIT_DOMAINS?.split(",")[0]}`;
+    try {
+      const result = await stripeSync.findOrCreateManagedWebhook(`${webhookBaseUrl}/api/stripe/webhook`);
+      console.log(`Webhook configured: ${result?.webhook?.url || "OK"}`);
+    } catch (webhookErr: any) {
+      console.warn("Webhook setup skipped (may need deployment):", webhookErr.message);
     }
-  });
-  next();
-});
+    stripeSync.syncBackfill().then(() => console.log("Stripe data synced")).catch((err: any) => console.error("Error syncing Stripe data:", err));
+  } catch (error) {
+    console.error("Failed to initialize Stripe:", error);
+  }
+}
 
 (async () => {
-  await registerRoutes(httpServer, app);
+  assertStartupConfig();
 
-  app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
-    const status = err.status || err.statusCode || 500;
-    const message = status >= 500 ? "Internal Server Error" : "Invalid request";
+  // Production never alters schema at startup; it refuses to serve against an unmigrated database.
+  const status = await migrationStatus(pool);
+  if (status.pending > 0 || status.baselineRequired) {
+    const msg = `Database migrations pending: ${status.baselineRequired ? "legacy schema needs `npm run db:migrate -- --baseline`" : `${status.pending} pending`}`;
+    if (isProduction()) { console.error(msg); process.exit(1); }
+    console.warn(`${msg}. Run \`npm run db:migrate\`.`);
+  }
 
-    console.error(JSON.stringify({ event: "request_error", status }));
+  if (!isProduction() && process.env.STRIPE_DEV_PROVISION === "true") await initStripe();
 
-    if (res.headersSent) {
-      return next(err);
-    }
-
-    return res.status(status).json({ message });
-  });
+  const { app, httpServer } = await createApp();
 
   if (process.env.NODE_ENV === "production") {
     serveStatic(app);
@@ -134,15 +53,17 @@ app.use((req, res, next) => {
     await setupVite(httpServer, app);
   }
 
+  // In-process worker by default; set ANALYSIS_WORKER=off when running `npm run worker` separately.
+  const stopWorker = process.env.ANALYSIS_WORKER === "off" ? null : startWorker();
+
   const port = parseInt(process.env.PORT || "5000", 10);
-  httpServer.listen(
-    {
-      port,
-      host: "0.0.0.0",
-      reusePort: true,
-    },
-    () => {
-      log(`serving on port ${port}`);
-    },
-  );
+  httpServer.listen({ port, host: "0.0.0.0", reusePort: true }, () => log(`serving on port ${port}`));
+
+  const shutdown = async () => {
+    httpServer.close();
+    await stopWorker?.();
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 })();

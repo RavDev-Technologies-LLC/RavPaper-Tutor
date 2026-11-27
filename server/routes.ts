@@ -1,165 +1,32 @@
-import type { Express } from "express";
+import express, { type Express } from "express";
 import type { Server } from "http";
-import { storage, InsufficientCreditsError, PaymentOwnershipError, AnalysisInProgressError } from "./storage";
-import { ownsPayment, parseCreditAmount, validCatalogPrice } from "./billing-policy";
-import {
-  authMiddleware,
-  requireRole,
-  hashPassword,
-  comparePassword,
-  generateAccessToken,
-  generateRefreshToken,
-} from "./auth";
-import jwt from "jsonwebtoken";
-import { ownsDocument, canReadRubric, canChangeRole, tokenHasPurpose } from "./security-policy";
-import {
-  runPlagiarismEngine,
-  runRubricEngine,
-  runStatisticsEngine,
-  runLiteratureEngine,
-  runAnthropomorphismEngine,
-  runFormattingEngine,
-  generateDefenseQuestions,
-  evaluateDefenseAnswer,
-  runScoringAggregator,
-} from "./engines";
-import { getUncachableStripeClient, getStripePublishableKey } from "./stripeClient";
+import multer from "multer";
+import { storage, InsufficientCreditsError, AnalysisInProgressError } from "./storage";
+import { creditsForCatalogPrice, loadBillingConfig } from "./billing-policy";
+import { authMiddleware, requireRole } from "./auth";
+import { registerAuthRoutes, getIp } from "./auth-routes";
+import type { AuthRateLimits } from "./rate-limit";
+import { ownsDocument, canReadRubric, canChangeRole } from "./security-policy";
+import { generateDefenseQuestions, evaluateDefenseAnswer } from "./engines";
+import { getStripePublishableKey, getVerifiedStripe, BillingUnavailableError } from "./stripeClient";
+import { fulfillCheckoutSession } from "./fulfillment";
+import { extractText, ExtractionError, MAX_UPLOAD_BYTES } from "./extraction";
+import { ALL_ENGINES, enqueueAnalysis, getJob, requestCancel, type EngineName } from "./jobs";
 import { sql } from "drizzle-orm";
 import { db } from "./db";
-import type { InsertAnnotation } from "@shared/schema";
+import { submissionTypeEnum } from "@shared/schema";
 
-const JWT_SECRET = process.env.SESSION_SECRET!;
+export type RouteOptions = { authRateLimits?: AuthRateLimits };
 
-function getIp(req: any): string | null {
-  const ip = req.ip;
-  if (!ip) return null;
-  return typeof ip === "string" ? ip : ip[0] || null;
-}
-
-const ALL_ENGINES = [
-  "plagiarism",
-  "rubric_alignment",
-  "statistics",
-  "literature_review",
-  "anthropomorphism",
-  "formatting",
-];
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 10 } });
+const SUBMISSION_TYPES = submissionTypeEnum.enumValues as readonly string[];
 
 export async function registerRoutes(
   httpServer: Server,
-  app: Express
+  app: Express,
+  options: RouteOptions = {},
 ): Promise<Server> {
-
-  // ─── Auth Routes ───────────────────────────────────────────────
-  app.post("/api/auth/register", async (req, res) => {
-    try {
-      const { username, email, password, fullName } = req.body;
-      if (!username || !email || !password || !fullName) {
-        return res.status(400).json({ error: "All fields are required" });
-      }
-
-      const existingEmail = await storage.getUserByEmail(email);
-      if (existingEmail) return res.status(409).json({ error: "Email already in use" });
-
-      const existingUsername = await storage.getUserByUsername(username);
-      if (existingUsername) return res.status(409).json({ error: "Username already taken" });
-
-      const slug = username.toLowerCase().replace(/[^a-z0-9]/g, "-");
-      const tenant = await storage.createTenant({
-        name: `${fullName}'s Organization`,
-        slug: slug + "-org",
-        plan: "free",
-        isActive: true,
-      });
-
-      const hashedPassword = await hashPassword(password);
-      const user = await storage.createUser({
-        tenantId: tenant.id,
-        username,
-        email,
-        password: hashedPassword,
-        fullName,
-        role: "student",
-        isActive: true,
-      });
-
-      await storage.createAuditLog({
-        tenantId: tenant.id,
-        userId: user.id,
-        action: "user_registered",
-        resourceType: "user",
-        resourceId: user.id,
-        details: { email, role: user.role },
-        ipAddress: getIp(req),
-      });
-
-      const { password: _, ...safeUser } = user;
-      res.status(201).json({
-        user: safeUser,
-        accessToken: generateAccessToken(user),
-        refreshToken: generateRefreshToken(user),
-      });
-    } catch (e: any) {
-      res.status(500).json({ error: "Internal server error" });
-    }
-  });
-
-  app.post("/api/auth/login", async (req, res) => {
-    try {
-      const { email, password } = req.body;
-      if (!email || !password) return res.status(400).json({ error: "Email and password required" });
-
-      const user = await storage.getUserByEmail(email);
-      if (!user) return res.status(401).json({ error: "Invalid credentials" });
-      if (!user.isActive) return res.status(403).json({ error: "Account disabled" });
-
-      const valid = await comparePassword(password, user.password);
-      if (!valid) return res.status(401).json({ error: "Invalid credentials" });
-
-      await storage.createAuditLog({
-        tenantId: user.tenantId,
-        userId: user.id,
-        action: "user_login",
-        resourceType: "user",
-        resourceId: user.id,
-        ipAddress: getIp(req),
-      });
-
-      const { password: _, ...safeUser } = user;
-      res.json({
-        user: safeUser,
-        accessToken: generateAccessToken(user),
-        refreshToken: generateRefreshToken(user),
-      });
-    } catch (e: any) {
-      res.status(500).json({ error: "Internal server error" });
-    }
-  });
-
-  app.post("/api/auth/refresh", async (req, res) => {
-    try {
-      const { refreshToken } = req.body;
-      if (!refreshToken) return res.status(400).json({ error: "Refresh token required" });
-
-      const payload = jwt.verify(refreshToken, JWT_SECRET, { algorithms: ["HS256"] });
-      if (!tokenHasPurpose(payload, "refresh")) return res.status(401).json({ error: "Invalid token type" });
-
-      const user = await storage.getUser(payload.userId);
-      if (!user || !user.isActive) return res.status(401).json({ error: "Unauthorized" });
-
-      res.json({
-        accessToken: generateAccessToken(user),
-        refreshToken: generateRefreshToken(user),
-      });
-    } catch {
-      res.status(401).json({ error: "Invalid refresh token" });
-    }
-  });
-
-  app.get("/api/auth/me", authMiddleware, async (req, res) => {
-    const { password: _, ...safeUser } = req.user!;
-    res.json(safeUser);
-  });
+  registerAuthRoutes(app, options.authRateLimits);
 
   // ─── Document Routes ───────────────────────────────────────────
   app.get("/api/documents", authMiddleware, async (req, res) => {
@@ -171,38 +38,40 @@ export async function registerRoutes(
     }
   });
 
-  app.post("/api/documents", authMiddleware, async (req, res) => {
-    try {
-      const { title, submissionType, fileName, fileSize, fileContent } = req.body;
-      if (!title || !submissionType || !fileName) {
-        return res.status(400).json({ error: "Title, submissionType, and fileName are required" });
+  // Multipart upload: the server extracts text from PDF, DOCX, TXT and Markdown.
+  app.post("/api/documents/upload", authMiddleware, (req, res, next) => {
+    upload.single("file")(req, res, (err: any) => {
+      if (err instanceof multer.MulterError) {
+        return res.status(err.code === "LIMIT_FILE_SIZE" ? 413 : 400).json({ error: err.code === "LIMIT_FILE_SIZE" ? "File exceeds the 20 MB limit" : "Invalid upload" });
       }
+      if (err) return next(err);
+      next();
+    });
+  }, async (req, res) => {
+    try {
+      const file = req.file;
+      const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
+      const submissionType = req.body?.submissionType;
+      if (!file) return res.status(400).json({ error: "A file is required" });
+      if (!title || title.length > 300) return res.status(400).json({ error: "Title is required (max 300 characters)" });
+      if (!SUBMISSION_TYPES.includes(submissionType)) return res.status(400).json({ error: "Invalid submission type" });
+      const fileName = file.originalname.slice(0, 255);
+
+      let extracted;
+      try { extracted = await extractText(fileName, file.buffer); }
+      catch (e) { if (e instanceof ExtractionError) return res.status(422).json({ error: e.message, code: e.code }); throw e; }
 
       const doc = await storage.createDocument({
-        tenantId: req.user!.tenantId,
-        userId: req.user!.id,
-        title,
-        submissionType,
-        fileName,
-        fileSize: fileSize || null,
-        fileContent: fileContent || null,
-        status: "pending",
-        overallScore: null,
-        metadata: null,
+        tenantId: req.user!.tenantId, userId: req.user!.id, title, submissionType, fileName,
+        fileSize: file.size, fileContent: extracted.text, status: "pending", overallScore: null,
+        metadata: { extraction: { format: extracted.format, pages: extracted.pages, words: extracted.words, chars: extracted.chars } },
       });
-
       await storage.createAuditLog({
-        tenantId: req.user!.tenantId,
-        userId: req.user!.id,
-        action: "document_uploaded",
-        resourceType: "document",
-        resourceId: String(doc.id),
-        details: { title, fileName },
-        ipAddress: getIp(req),
+        tenantId: req.user!.tenantId, userId: req.user!.id, action: "document_uploaded", resourceType: "document",
+        resourceId: String(doc.id), details: { title, fileName, format: extracted.format, words: extracted.words }, ipAddress: getIp(req),
       });
-
       res.status(201).json(doc);
-    } catch (e: any) {
+    } catch {
       res.status(500).json({ error: "Internal server error" });
     }
   });
@@ -224,22 +93,12 @@ export async function registerRoutes(
     try {
       const doc = await storage.getDocument(Number(req.params.id));
       if (!doc) return res.status(404).json({ error: "Document not found" });
-      if (!ownsDocument(req.user!, doc)) {
-        return res.status(403).json({ error: "Forbidden" });
-      }
-      await storage.deleteDocument(doc.id);
-
-      await storage.createAuditLog({
-        tenantId: req.user!.tenantId,
-        userId: req.user!.id,
-        action: "document_deleted",
-        resourceType: "document",
-        resourceId: String(doc.id),
-        ipAddress: getIp(req),
-      });
-
+      if (!ownsDocument(req.user!, doc)) return res.status(403).json({ error: "Forbidden" });
+      const outcome = await storage.deleteDocument(doc.id, { userId: req.user!.id, tenantId: req.user!.tenantId, ipAddress: getIp(req) });
+      if (outcome === "not_found") return res.status(404).json({ error: "Document not found" });
+      if (outcome === "busy") return res.status(409).json({ error: "Cancel the running analysis before deleting this document" });
       res.status(204).send();
-    } catch (e: any) {
+    } catch {
       res.status(500).json({ error: "Internal server error" });
     }
   });
@@ -305,10 +164,8 @@ export async function registerRoutes(
   });
 
   // ─── Analysis Routes ───────────────────────────────────────────
+  // Enqueue a durable analysis job; the worker does the work outside the request.
   app.post("/api/analysis/run/:documentId", authMiddleware, async (req, res) => {
-    let usageId: number | undefined;
-    let currentResultId: number | undefined;
-    let finalized = false;
     try {
       const documentId = Number(req.params.documentId);
       const doc = await storage.getDocument(documentId);
@@ -316,142 +173,68 @@ export async function registerRoutes(
       if (!ownsDocument(req.user!, doc)) return res.status(403).json({ error: "Forbidden" });
       if (!doc.fileContent) return res.status(400).json({ error: "Document has no content to analyze" });
 
-      const currentUser = await storage.getUser(req.user!.id);
-      if (!currentUser || currentUser.reviewCredits < 1) {
-        return res.status(402).json({
-          error: "Insufficient review credits",
-          credits: currentUser?.reviewCredits ?? 0,
-          message: "You need at least 1 review credit to run an analysis. Purchase credits from the Pricing page.",
-        });
-      }
-
       const { rubricId, engines } = req.body || {};
-      if (engines !== undefined && (!Array.isArray(engines) || !engines.length || engines.length > ALL_ENGINES.length || engines.some((engine: unknown) => typeof engine !== "string" || !ALL_ENGINES.includes(engine)) || new Set(engines).size !== engines.length)) return res.status(400).json({ error: "Invalid analysis engine selection" });
-      const engineList: string[] = engines ?? ALL_ENGINES;
+      const all = ALL_ENGINES as readonly string[];
+      if (engines !== undefined && (!Array.isArray(engines) || !engines.length || engines.length > all.length || engines.some((e: unknown) => typeof e !== "string" || !all.includes(e)) || new Set(engines).size !== engines.length)) {
+        return res.status(400).json({ error: "Invalid analysis engine selection" });
+      }
       if (rubricId !== undefined && rubricId !== null) {
         if (!Number.isSafeInteger(rubricId) || rubricId < 1) return res.status(400).json({ error: "Invalid rubric" });
         const selectedRubric = await storage.getRubric(rubricId);
         if (!selectedRubric || !canReadRubric(req.user!, selectedRubric)) return res.status(403).json({ error: "Rubric unavailable" });
       }
 
-      try { const debit = await storage.deductCredit(req.user!.id, documentId, `Analysis of "${doc.title}"`); usageId = debit.transaction.id; }
-      catch (error) { if (error instanceof InsufficientCreditsError) return res.status(402).json({ error: "Insufficient review credits" }); if (error instanceof AnalysisInProgressError) return res.status(409).json({ error: "Document unavailable or already processing" }); throw error; }
-
-      await storage.createAuditLog({
-        tenantId: req.user!.tenantId,
-        userId: req.user!.id,
-        action: "analysis_started",
-        resourceType: "document",
-        resourceId: String(documentId),
-        details: { engines: engineList },
-        ipAddress: getIp(req),
-      });
-
-      let rubricCriteria: any[] = [];
-      if (rubricId) {
-        const rubric = await storage.getRubric(rubricId);
-        if (rubric) rubricCriteria = rubric.criteria as any[];
+      try {
+        const job = await enqueueAnalysis({ userId: req.user!.id, documentId, rubricId: rubricId ?? null, engines: (engines ?? [...ALL_ENGINES]) as EngineName[] });
+        res.status(202).json({ jobId: job.id, status: job.status });
+      } catch (error) {
+        if (error instanceof InsufficientCreditsError) return res.status(402).json({ error: "Insufficient review credits", message: "You need at least 1 review credit to run an analysis. Purchase credits from the Pricing page." });
+        if (error instanceof AnalysisInProgressError || (error as any)?.code === "23505") return res.status(409).json({ error: "Document unavailable or already processing" });
+        throw error;
       }
+    } catch {
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
 
-      const results: any[] = [];
-      const content = doc.fileContent;
+  const jobView = (j: NonNullable<Awaited<ReturnType<typeof getJob>>>) => ({
+    id: j.id, documentId: j.documentId, status: j.status, engines: j.engines, attempts: j.attempts, maxAttempts: j.maxAttempts,
+    cancelRequested: j.cancelRequested, error: j.status === "failed" ? "Analysis failed; your review credit was restored" : null,
+    createdAt: j.createdAt, startedAt: j.startedAt, finishedAt: j.finishedAt,
+  });
 
-      for (const engine of engineList) {
-        const record = await storage.createAnalysisResult({
-          tenantId: req.user!.tenantId,
-          documentId,
-          engineType: engine,
-          status: "processing",
-          score: null,
-          results: null,
-          details: null,
-        });
+  app.get("/api/analysis/jobs/:id", authMiddleware, async (req, res) => {
+    try {
+      const job = await getJob(Number(req.params.id));
+      if (!job || job.userId !== req.user!.id || job.tenantId !== req.user!.tenantId) return res.status(404).json({ error: "Job not found" });
+      const completed = await db.execute(sql`select engine_type from analysis_results where job_id = ${job.id} and status = 'completed'`);
+      res.json({ ...jobView(job), completedEngines: completed.rows.map((r: any) => r.engine_type) });
+    } catch {
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
 
-        currentResultId = record.id;
-        let engineResult: any;
-        try {
-          switch (engine) {
-            case "plagiarism":
-              engineResult = await runPlagiarismEngine(content);
-              break;
-            case "rubric_alignment":
-              engineResult = await runRubricEngine(content, rubricCriteria);
-              break;
-            case "statistics":
-              engineResult = await runStatisticsEngine(content);
-              break;
-            case "literature_review":
-              engineResult = await runLiteratureEngine(content);
-              break;
-            case "anthropomorphism":
-              engineResult = await runAnthropomorphismEngine(content);
-              break;
-            case "formatting":
-              engineResult = await runFormattingEngine(content);
-              break;
-            default:
-              throw new Error("Unknown engine");
-          }
-        } catch {
-          throw new Error("Analysis engine failed");
-        }
+  app.get("/api/documents/:id/jobs/latest", authMiddleware, async (req, res) => {
+    try {
+      const doc = await storage.getDocument(Number(req.params.id));
+      if (!doc || !ownsDocument(req.user!, doc)) return res.status(404).json({ error: "Document not found" });
+      const r = await db.execute(sql`select id from analysis_jobs where document_id = ${doc.id} order by id desc limit 1`);
+      const id = (r.rows[0] as any)?.id;
+      const job = id ? await getJob(Number(id)) : undefined;
+      res.json(job ? jobView(job) : null);
+    } catch {
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
 
-        const updated = await storage.updateAnalysisResult(record.id, {
-          status: "completed",
-          score: engineResult.score,
-          results: engineResult,
-        });
-
-        const findings = engineResult.findings || engineResult.criteriaScores || [];
-        if (findings.length > 0) {
-          const annotationBatch: InsertAnnotation[] = findings.slice(0, 50).map((f: any) => ({
-            tenantId: req.user!.tenantId,
-            documentId,
-            analysisResultId: record.id,
-            sentenceIndex: null,
-            originalText: f.text || f.criterion || f.statistic || f.section || f.location || "",
-            suggestion: f.suggestion || f.feedback || f.correction || null,
-            severity: (f.severity === "critical" || f.severity === "warning" || f.severity === "info")
-              ? f.severity
-              : "info",
-            engineType: engine,
-            category: f.category || null,
-          }));
-          await storage.createManyAnnotations(annotationBatch);
-        }
-
-        if (!updated) throw new Error("Analysis result unavailable");
-        results.push(updated);
-        currentResultId = undefined;
-      }
-
-      const aggregated = runScoringAggregator(
-        results.map((r) => ({ engineType: r!.engineType, score: r!.score }))
-      );
-      await storage.updateDocument(documentId, {
-        status: "completed",
-        overallScore: aggregated.overallScore,
-        metadata: aggregated,
-      } as any);
-
-      finalized = true;
-      await storage.createAuditLog({
-        tenantId: req.user!.tenantId,
-        userId: req.user!.id,
-        action: "analysis_completed",
-        resourceType: "document",
-        resourceId: String(documentId),
-        details: { overallScore: aggregated.overallScore, engines: engineList },
-        ipAddress: getIp(req),
-      });
-
-      res.json({ results, aggregated });
-    } catch (e: any) {
-      if (usageId !== undefined && !finalized) {
-        try { await storage.refundFailedAnalysis(req.user!.id, usageId, currentResultId); }
-        catch { console.error(JSON.stringify({ event: "analysis_refund_failed", usageId })); return res.status(503).json({ error: "Analysis failed; credit reconciliation required" }); }
-        return res.status(502).json({ error: "Analysis failed; review credit restored" });
-      }
+  app.post("/api/analysis/jobs/:id/cancel", authMiddleware, async (req, res) => {
+    try {
+      const job = await getJob(Number(req.params.id));
+      if (!job || job.userId !== req.user!.id || job.tenantId !== req.user!.tenantId) return res.status(404).json({ error: "Job not found" });
+      const outcome = await requestCancel(job.id);
+      await storage.createAuditLog({ tenantId: job.tenantId, userId: req.user!.id, action: "analysis_cancel_requested", resourceType: "document", resourceId: String(job.documentId), details: { jobId: job.id, outcome }, ipAddress: getIp(req) });
+      res.status(outcome === "finished" ? 409 : 202).json({ status: outcome });
+    } catch {
       res.status(500).json({ error: "Internal server error" });
     }
   });
@@ -647,47 +430,30 @@ export async function registerRoutes(
     }
   });
 
+  // Only allow-listed, catalog-matching prices are offered.
   app.get("/api/stripe/products", async (_req, res) => {
     try {
+      const config = loadBillingConfig();
+      if (!config) return res.json([]);
+      const priceIds = config.prices.map((p) => p.priceId);
       const result = await db.execute(sql`
-        SELECT 
-          p.id as product_id,
-          p.name as product_name,
-          p.description as product_description,
-          p.active as product_active,
-          p.metadata as product_metadata,
-          pr.id as price_id,
-          pr.unit_amount,
-          pr.currency
+        SELECT p.id as product_id, p.name as product_name, p.description as product_description, p.active as product_active,
+               p.metadata as product_metadata, pr.id as price_id, pr.unit_amount, pr.currency, pr.type, pr.active as price_active, pr.livemode
         FROM stripe.products p
-        JOIN stripe.prices pr ON pr.product = p.id AND pr.active = true
-        WHERE p.active = true
-        ORDER BY pr.unit_amount ASC
-      `);
-
-      const productsMap = new Map<string, any>();
-      for (const row of result.rows) {
-        const r = row as any;
-        if (!productsMap.has(r.product_id)) {
-          productsMap.set(r.product_id, {
-            id: r.product_id,
-            name: r.product_name,
-            description: r.product_description,
-            metadata: r.product_metadata,
-            prices: [],
-          });
-        }
-        if (r.price_id) {
-          productsMap.get(r.product_id).prices.push({
-            id: r.price_id,
-            unitAmount: r.unit_amount,
-            currency: r.currency,
-          });
-        }
+        JOIN stripe.prices pr ON pr.product = p.id
+        WHERE pr.id IN (${sql.join(priceIds.map((id) => sql`${id}`), sql`, `)})
+        ORDER BY pr.unit_amount ASC`);
+      const products: any[] = [];
+      for (const r of result.rows as any[]) {
+        const credits = creditsForCatalogPrice(
+          { id: r.price_id, active: r.price_active, type: r.type, unit_amount: r.unit_amount, currency: r.currency, product: r.product_id, livemode: r.livemode },
+          { id: r.product_id, active: r.product_active, metadata: r.product_metadata ?? {} }, config);
+        if (credits === null) continue;
+        products.push({ id: r.product_id, name: r.product_name, description: r.product_description, metadata: r.product_metadata,
+          prices: [{ id: r.price_id, unitAmount: r.unit_amount, currency: r.currency }] });
       }
-
-      res.json(Array.from(productsMap.values()));
-    } catch (e: any) {
+      res.json(products);
+    } catch {
       res.status(500).json({ error: "Internal server error" });
     }
   });
@@ -696,7 +462,7 @@ export async function registerRoutes(
     try {
       const key = await getStripePublishableKey();
       res.json({ publishableKey: key });
-    } catch (e: any) {
+    } catch {
       res.status(500).json({ error: "Internal server error" });
     }
   });
@@ -707,15 +473,17 @@ export async function registerRoutes(
       if (typeof priceId !== "string" || typeof productId !== "string" || !priceId || !productId) {
         return res.status(400).json({ error: "priceId and productId are required" });
       }
+      const allowed = loadBillingConfig()?.prices.find((p) => p.priceId === priceId && p.productId === productId);
+      if (!allowed) return res.status(400).json({ error: "Invalid credit package" });
 
-      const stripe = await getUncachableStripeClient();
+      const { stripe, config } = await getVerifiedStripe();
       const user = req.user!;
       const price = await stripe.prices.retrieve(priceId);
       const product = await stripe.products.retrieve(productId);
       const productOfPrice = typeof price.product === "string" ? price.product : price.product.id;
-      if (!validCatalogPrice({ ...price, product: productOfPrice }, product)) return res.status(400).json({ error: "Invalid credit package" });
-      if (price.livemode && process.env.STRIPE_LIVE_CHARGING_ENABLED !== "true") return res.status(503).json({ error: "Live payments disabled" });
-      const credits = parseCreditAmount(product.metadata.credits)!;
+      const credits = creditsForCatalogPrice({ ...price, product: productOfPrice }, product, config);
+      if (credits === null) return res.status(400).json({ error: "Invalid credit package" });
+
       const configuredOrigin = process.env.APP_BASE_URL;
       if (!configuredOrigin) return res.status(503).json({ error: "Payment configuration unavailable" });
       const origin = new URL(configuredOrigin);
@@ -725,9 +493,7 @@ export async function registerRoutes(
       let customerId = user.stripeCustomerId;
       if (!customerId) {
         const customer = await stripe.customers.create({
-          email: user.email,
-          name: user.fullName,
-          metadata: { userId: user.id, tenantId: String(user.tenantId) },
+          email: user.email, name: user.fullName, metadata: { userId: user.id, tenantId: String(user.tenantId) },
         }, { idempotencyKey: `ravpaper-customer-${user.id}` });
         customerId = customer.id;
         await storage.updateUser(user.id, { stripeCustomerId: customerId } as any);
@@ -740,67 +506,29 @@ export async function registerRoutes(
         mode: "payment",
         success_url: `${baseUrl}/pricing?success=true&session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${baseUrl}/pricing?canceled=true`,
-        metadata: {
-          userId: user.id,
-          tenantId: String(user.tenantId),
-          credits: String(credits),
-          productId,
-          priceId,
-        },
+        metadata: { userId: user.id, tenantId: String(user.tenantId), credits: String(credits), productId, priceId },
       });
-
       res.json({ url: session.url });
-    } catch (e: any) {
+    } catch (e) {
+      if (e instanceof BillingUnavailableError) return res.status(503).json({ error: "Payments are temporarily unavailable" });
       res.status(500).json({ error: "Internal server error" });
     }
   });
 
+  // Post-redirect fallback; the signed webhook is the authoritative fulfillment path.
   app.post("/api/stripe/verify-session", authMiddleware, async (req, res) => {
     try {
       const { sessionId } = req.body;
-      if (typeof sessionId !== "string" || !sessionId || sessionId.length > 256) return res.status(400).json({ error: "sessionId required" });
-
-      const stripe = await getUncachableStripeClient();
+      if (typeof sessionId !== "string" || !/^cs_(test|live)_[A-Za-z0-9]{1,250}$/.test(sessionId)) return res.status(400).json({ error: "sessionId required" });
+      const { stripe, config } = await getVerifiedStripe();
       const session = await stripe.checkout.sessions.retrieve(sessionId);
-
-      const customer = typeof session.customer === "string" ? session.customer : session.customer?.id ?? null;
-      if (!ownsPayment(req.user!, { customer, metadata: session.metadata })) return res.status(403).json({ error: "Forbidden" });
-      if (session.mode !== "payment" || session.status !== "complete" || session.payment_status !== "paid" || !session.amount_total || session.currency !== "usd") {
-        return res.json({ success: false, message: "Payment not completed" });
-      }
-
-      const existingTx = await storage.getCreditTransactions(req.user!.id);
-      const alreadyProcessed = existingTx.some(tx => tx.stripeSessionId === sessionId);
-      if (alreadyProcessed) {
-        const user = await storage.getUser(req.user!.id);
-        return res.json({ success: true, credits: user?.reviewCredits ?? 0, alreadyProcessed: true });
-      }
-
-      const credits = parseCreditAmount(session.metadata?.credits);
-      if (credits === null || !session.metadata?.priceId || !session.metadata?.productId) return res.status(409).json({ error: "Payment requires reconciliation" });
-      const lineItems = await stripe.checkout.sessions.listLineItems(sessionId, { limit: 2 });
-      const item = lineItems.data[0];
-      if (lineItems.has_more || lineItems.data.length !== 1 || !item || !item.price || item.quantity !== 1 || item.price.id !== session.metadata.priceId || (typeof item.price.product === "string" ? item.price.product : item.price.product?.id) !== session.metadata.productId || item.amount_total !== session.amount_total) return res.status(409).json({ error: "Payment requires reconciliation" });
-      const { user: updatedUser } = await storage.addCredits(
-        req.user!.id,
-        credits,
-        `Purchased ${credits} review credit${credits > 1 ? "s" : ""}`,
-        sessionId
-      );
-
-      await storage.createAuditLog({
-        tenantId: req.user!.tenantId,
-        userId: req.user!.id,
-        action: "credits_purchased",
-        resourceType: "credits",
-        resourceId: sessionId,
-        details: { credits, sessionId },
-        ipAddress: getIp(req),
-      });
-
-      res.json({ success: true, credits: updatedUser.reviewCredits });
-    } catch (e: any) {
-      if (e instanceof PaymentOwnershipError) return res.status(403).json({ error: "Forbidden" });
+      if (session.metadata?.userId !== req.user!.id) return res.status(403).json({ error: "Forbidden" });
+      const result = await fulfillCheckoutSession(stripe, session, config, "client");
+      if (result.status === "not_paid") return res.json({ success: false, message: "Payment not completed" });
+      if (result.status === "rejected") return res.status(result.reason === "ownership" ? 403 : 409).json({ error: "Payment requires reconciliation" });
+      res.json({ success: true, credits: result.balance, alreadyProcessed: result.status === "already_fulfilled" });
+    } catch (e) {
+      if (e instanceof BillingUnavailableError) return res.status(503).json({ error: "Payments are temporarily unavailable" });
       res.status(500).json({ error: "Internal server error" });
     }
   });
