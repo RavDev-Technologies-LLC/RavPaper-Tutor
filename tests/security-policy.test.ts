@@ -29,11 +29,12 @@ test("role changes reject self-promotion and cross-tenant requests", () => {
   assert.equal(canChangeRole(admin, other, "chair"), true);
   assert.equal(canChangeRole(student, other, "chair"), false);
 });
-test("access and refresh token purposes are mutually exclusive", () => {
-  assert.equal(tokenHasPurpose({ userId: "a", type: "refresh" }, "access"), false);
-  assert.equal(tokenHasPurpose({ userId: "a", type: "access" }, "access"), true);
-  assert.equal(tokenHasPurpose({ userId: "a", type: "access" }, "refresh"), false);
+test("access tokens require purpose and a bound session id", () => {
+  assert.equal(tokenHasPurpose({ userId: "a", type: "refresh", sid: "s" }, "access"), false);
+  assert.equal(tokenHasPurpose({ userId: "a", type: "access", sid: "s" }, "access"), true);
+  assert.equal(tokenHasPurpose({ userId: "a", type: "access" }, "access"), false);
+  assert.equal(tokenHasPurpose({ userId: "a", type: "access", sid: "" }, "access"), false);
   assert.equal(tokenHasPurpose({ userId: "a" }, "access"), false);
   assert.equal(tokenHasPurpose("invalid", "access"), false);
-  assert.equal(tokenHasPurpose({ userId: 1, type: "access" }, "access"), false);
+  assert.equal(tokenHasPurpose({ userId: 1, type: "access", sid: "s" }, "access"), false);
 });
