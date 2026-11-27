@@ -570,18 +570,19 @@ export async function registerRoutes(
       const validRoles = ["student", "doctoral_candidate", "chair", "committee_member", "program_admin", "security_admin", "super_admin"];
       if (!validRoles.includes(role)) return res.status(400).json({ error: "Invalid role" });
 
-      const targetUser = await storage.getUser(req.params.id);
+      const targetId = String(req.params.id);
+      const targetUser = await storage.getUser(targetId);
       if (!targetUser) return res.status(404).json({ error: "User not found" });
       if (!canChangeRole(req.user!, targetUser, role)) return res.status(403).json({ error: "Forbidden" });
 
-      const updated = await storage.updateUser(req.params.id, { role } as any);
+      const updated = await storage.updateUser(targetId, { role } as any);
 
       await storage.createAuditLog({
         tenantId: req.tenantId!,
         userId: req.user!.id,
         action: "user_role_changed",
         resourceType: "user",
-        resourceId: req.params.id,
+        resourceId: targetId,
         details: { oldRole: targetUser.role, newRole: role },
         ipAddress: getIp(req),
       });
