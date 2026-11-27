@@ -1,4 +1,4 @@
-import type { QueryFunction } from "@tanstack/react-query";
+import type { QueryFunctionContext } from "@tanstack/react-query";
 
 const ACCESS_TOKEN_KEY = "pt_access_token";
 const REFRESH_TOKEN_KEY = "pt_refresh_token";
@@ -76,13 +76,13 @@ export async function authFetch(url: string, options?: RequestInit): Promise<Res
   return res;
 }
 
-export const authQueryFn: QueryFunction = async ({ queryKey }) => {
+export async function authQueryFn<T>({ queryKey }: QueryFunctionContext): Promise<T> {
   const url = queryKey[0] as string;
   const fullUrl = queryKey.length > 1 ? `${url}/${queryKey.slice(1).join("/")}` : url;
   const res = await authFetch(fullUrl);
 
   if (res.status === 401) {
-    return null;
+    return null as T;
   }
 
   if (!res.ok) {
@@ -90,5 +90,5 @@ export const authQueryFn: QueryFunction = async ({ queryKey }) => {
     throw new Error(`${res.status}: ${text}`);
   }
 
-  return await res.json();
-};
+  return (await res.json()) as T;
+}

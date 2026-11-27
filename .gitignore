@@ -16,3 +16,8 @@ test-results/
 *.tsbuildinfo
 *.pem
 *.key
+
+# Replit / editor-local artifacts
+.upm/
+.local/
+attached_assets/
